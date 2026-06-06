@@ -34,6 +34,33 @@ app = Server("discord-server")
 # Store Discord client reference
 discord_client = None
 
+# Per-channel continuous "typing…" loops — kept alive until a message is sent or explicitly stopped.
+_typing_tasks = {}          # channel_id -> asyncio.Task
+_TYPING_INTERVAL = 8        # re-trigger before the ~10s indicator fades
+_TYPING_MAX_SECONDS = 300   # safety cap: never loop forever
+
+
+async def _typing_loop(channel_id: int):
+    elapsed = 0
+    try:
+        while elapsed < _TYPING_MAX_SECONDS:
+            await discord_client.http.send_typing(channel_id)
+            await asyncio.sleep(_TYPING_INTERVAL)
+            elapsed += _TYPING_INTERVAL
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"typing loop for {channel_id} stopped: {e}")
+    finally:
+        _typing_tasks.pop(channel_id, None)
+
+
+def _stop_typing(channel_id: int):
+    t = _typing_tasks.pop(channel_id, None)
+    if t and not t.done():
+        t.cancel()
+
+
 @bot.event
 async def on_ready():
     global discord_client
@@ -238,6 +265,32 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="move_channel",
+            description="Move a channel to a different position or category",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "ID of the channel to move"
+                    },
+                    "position": {
+                        "type": "number",
+                        "description": "New position for the channel (0 = top)"
+                    },
+                    "category_id": {
+                        "type": "string",
+                        "description": "Optional: ID of the category to move the channel to"
+                    },
+                    "sync_permissions": {
+                        "type": "boolean",
+                        "description": "Whether to sync permissions with the new category (default: true)"
+                    }
+                },
+                "required": ["channel_id"]
+            }
+        ),
+        Tool(
             name="create_category",
             description="Create a new category in a server",
             inputSchema={
@@ -289,6 +342,34 @@ async def list_tools() -> List[Tool]:
                     }
                 },
                 "required": ["channel_id", "message_id", "emoji"]
+            }
+        ),
+        Tool(
+            name="start_typing",
+            description="Start a CONTINUOUS 'Bot is typing…' indicator in a channel — re-triggered every ~8s so it stays visible the whole time you think. Auto-stops when you send a message there (or call stop_typing). Call right when you begin composing a reply.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to show the typing indicator in"
+                    }
+                },
+                "required": ["channel_id"]
+            }
+        ),
+        Tool(
+            name="stop_typing",
+            description="Stop the continuous typing indicator started by start_typing (usually unnecessary — send_message stops it automatically).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to stop the typing indicator in"
+                    }
+                },
+                "required": ["channel_id"]
             }
         ),
         Tool(
@@ -355,6 +436,46 @@ async def list_tools() -> List[Tool]:
                     }
                 },
                 "required": ["channel_id", "content"]
+            }
+        ),
+        Tool(
+            name="send_file",
+            description="Send a file (image, document, etc.) to a Discord channel",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file to send"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Optional message text to accompany the file"
+                    }
+                },
+                "required": ["channel_id", "file_path"]
+            }
+        ),
+        Tool(
+            name="download_attachment",
+            description="Download a Discord attachment to a local file",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL of the attachment (from read_messages)"
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Local path to save the file"
+                    }
+                },
+                "required": ["url", "output_path"]
             }
         ),
         Tool(
@@ -550,10 +671,70 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     if name == "send_message":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.send(arguments["content"])
+        _stop_typing(int(arguments["channel_id"]))   # reply sent → stop the typing loop
         return [TextContent(
             type="text",
             text=f"Message sent successfully. Message ID: {message.id}"
         )]
+
+    elif name == "start_typing":
+        cid = int(arguments["channel_id"])
+        _stop_typing(cid)                            # restart cleanly if one is already running
+        _typing_tasks[cid] = asyncio.create_task(_typing_loop(cid))
+        return [TextContent(
+            type="text",
+            text=f"Continuous typing indicator started in channel {cid}"
+        )]
+
+    elif name == "stop_typing":
+        cid = int(arguments["channel_id"])
+        _stop_typing(cid)
+        return [TextContent(
+            type="text",
+            text=f"Typing indicator stopped in channel {cid}"
+        )]
+
+    elif name == "send_file":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        file_path = arguments["file_path"]
+        content = arguments.get("content", "")
+
+        file = discord.File(file_path)
+        message = await channel.send(content=content if content else None, file=file)
+        return [TextContent(
+            type="text",
+            text=f"File sent successfully. Message ID: {message.id}"
+        )]
+
+    elif name == "download_attachment":
+        import aiohttp
+        from pathlib import Path as PathLib
+        url = arguments["url"]
+        output_path = arguments["output_path"]
+
+        # Ensure output directory exists
+        PathLib(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        with open(output_path, 'wb') as f:
+                            f.write(await resp.read())
+                        return [TextContent(
+                            type="text",
+                            text=f"Downloaded to {output_path}"
+                        )]
+                    else:
+                        return [TextContent(
+                            type="text",
+                            text=f"Download failed: HTTP {resp.status}"
+                        )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Download error: {str(e)}"
+            )]
 
     elif name == "read_messages":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
@@ -570,21 +751,39 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 }
                 logger.error(f"Emoji: {emoji_str}")
                 reaction_data.append(reaction_info)
+
+            # Collect attachments
+            attachments_data = []
+            for attachment in message.attachments:
+                attachments_data.append({
+                    "id": str(attachment.id),
+                    "filename": attachment.filename,
+                    "url": attachment.url,
+                    "content_type": attachment.content_type,
+                    "size": attachment.size
+                })
+
             messages.append({
                 "id": str(message.id),
                 "author": str(message.author),
                 "content": message.content,
                 "timestamp": message.created_at.isoformat(),
-                "reactions": reaction_data  # Add reactions to message dict
+                "reactions": reaction_data,
+                "attachments": attachments_data
             })
+        message_texts = []
+        for m in messages:
+            reactions_text = ', '.join([f"{r['emoji']}({r['count']})" for r in m['reactions']]) if m['reactions'] else 'No reactions'
+            attachments_text = ', '.join([f"{a['filename']} ({a['url']})" for a in m['attachments']]) if m['attachments'] else 'No attachments'
+            message_texts.append(
+                f"ID: {m['id']}\n{m['author']} ({m['timestamp']}): {m['content']}\n"
+                f"Reactions: {reactions_text}\n"
+                f"Attachments: {attachments_text}"
+            )
+
         return [TextContent(
             type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" + 
-                 "\n".join([
-                     f"ID: {m['id']}\n{m['author']} ({m['timestamp']}): {m['content']}\n" +
-                     f"Reactions: {', '.join([f'{r['emoji']}({r['count']})' for r in m['reactions']]) if m['reactions'] else 'No reactions'}"
-                     for m in messages
-                 ])
+            text=f"Retrieved {len(messages)} messages:\n\n" + "\n\n".join(message_texts)
         )]
 
     elif name == "get_user_info":
@@ -943,6 +1142,55 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 text=f"Error setting channel permissions: {str(e)}"
             )]
         
+    elif name == "move_channel":
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+
+            # Build edit kwargs
+            edit_kwargs = {}
+
+            # Handle position
+            if "position" in arguments:
+                edit_kwargs["position"] = int(arguments["position"])
+
+            # Handle category
+            if "category_id" in arguments:
+                category = await discord_client.fetch_channel(int(arguments["category_id"]))
+                if not isinstance(category, discord.CategoryChannel):
+                    return [TextContent(
+                        type="text",
+                        text=f"Error: Channel {arguments['category_id']} is not a category"
+                    )]
+                edit_kwargs["category"] = category
+
+                # Sync permissions by default when moving to a new category
+                if arguments.get("sync_permissions", True):
+                    edit_kwargs["sync_permissions"] = True
+
+            # Apply changes
+            await channel.edit(**edit_kwargs, reason="Channel moved via MCP")
+
+            result_parts = [f"Moved channel #{channel.name}"]
+            if "position" in edit_kwargs:
+                result_parts.append(f"to position {edit_kwargs['position']}")
+            if "category" in edit_kwargs:
+                result_parts.append(f"into category {edit_kwargs['category'].name}")
+
+            return [TextContent(
+                type="text",
+                text=" ".join(result_parts)
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Error: Bot doesn't have permission to move this channel"
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error moving channel: {str(e)}"
+            )]
+
     elif name == "create_category":
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
         if not server_id:
