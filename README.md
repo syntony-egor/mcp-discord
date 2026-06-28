@@ -8,6 +8,7 @@ This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)*
 - `send_file` — upload a local file to a channel
 - `download_attachment` — save a Discord attachment to a local path
 - `move_channel` — reposition a channel / move it between categories
+- `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
 
 These additions are what the **[muraveynik](https://github.com/syntony-egor/muraveynik)** responder relies on (typing presence while the agent composes, exchanging images and documents) — see [Used by](#used-by).
 
@@ -128,6 +129,7 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 - `create_thread` (from a message or standalone)
 - `set_channel_permissions` (per-role view/send/read-history, optional @everyone)
 - `move_channel` *(fork addition)* — reposition / move between categories, optionally syncing category permissions.
+- `edit_channel` *(fork addition)* — rename a channel (full new name); bounded 5s wait so a rename rate-limit (2 / 10 min) returns cleanly instead of hanging.
 
 ### Roles
 - `create_role`, `delete_role`, `list_roles`

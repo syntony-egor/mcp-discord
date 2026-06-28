@@ -291,6 +291,28 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="edit_channel",
+            description="Rename a channel (e.g. change the leading emoji of a diary). Requires Manage Channels.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "ID of the channel to rename"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New channel name (full name, including any leading emoji)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional audit-log reason"
+                    }
+                },
+                "required": ["channel_id", "name"]
+            }
+        ),
+        Tool(
             name="create_category",
             description="Create a new category in a server",
             inputSchema={
@@ -1190,6 +1212,37 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 type="text",
                 text=f"Error moving channel: {str(e)}"
             )]
+
+    elif name == "edit_channel":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        new_name = arguments["name"]
+        try:
+            # Discord rate-limits channel renames to 2 / 10 min. On 429 discord.py does NOT
+            # raise — it silently sleeps retry_after (often hundreds of seconds) and retries,
+            # hanging this tool call. Bound the wait: a normal rename is < 1s; not done in
+            # time → we hit the limit, so cancel and tell the caller to try later.
+            await asyncio.wait_for(
+                channel.edit(name=new_name, reason=arguments.get("reason", "diary-emoji")),
+                timeout=5)
+        except (asyncio.TimeoutError, discord.RateLimited):
+            return [TextContent(
+                type="text",
+                text="Rename rate-limited (Discord allows 2 renames / 10 min). Try later."
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Error: Bot doesn't have permission to rename this channel"
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error renaming channel: {str(e)}"
+            )]
+        return [TextContent(
+            type="text",
+            text=f"Channel renamed to {new_name}"
+        )]
 
     elif name == "create_category":
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
