@@ -125,7 +125,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="list_members",
-            description="Get a list of members in a server",
+            description="Get a list of members in a server, each with their role names and avatar URL. Optionally filter to a single role (`role`) or to members who can view a channel (`channel_id`) — e.g. to collect everyone in a specific channel or with a specific role.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -138,6 +138,14 @@ async def list_tools() -> List[Tool]:
                         "description": "Maximum number of members to fetch",
                         "minimum": 1,
                         "maximum": 1000
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Optional: keep only members who have this role. Accepts a role ID or a role name (case-insensitive, e.g. 'Старички')."
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional: keep only members who can view this channel (i.e. who are 'in' that channel)."
                     }
                 },
                 "required": []
@@ -1023,23 +1031,69 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             )]
             
         guild = await discord_client.fetch_guild(int(server_id))
-        limit = min(int(arguments.get("limit", 100)), 1000)
-        
+        limit = min(int(arguments.get("limit", 1000)), 1000)
+
+        def _sized(asset, size=256):
+            try:
+                return asset.with_size(size).url
+            except Exception:
+                return asset.url
+
+        # Optional role filter: match by role ID (all digits) or by name (case-insensitive).
+        role_arg = (arguments.get("role") or "").strip().lstrip("@")
+        target_role = None
+        if role_arg:
+            if role_arg.isdigit():
+                target_role = guild.get_role(int(role_arg))
+            else:
+                low = role_arg.lower()
+                target_role = next((r for r in guild.roles if r.name.lower() == low), None) \
+                    or next((r for r in guild.roles if low in r.name.lower()), None)
+            if target_role is None:
+                return [TextContent(type="text", text=f"No role matching '{role_arg}' found in this server.")]
+
+        # Optional channel filter: keep members who can view that channel ("in" the channel).
+        target_channel = None
+        channel_arg = (arguments.get("channel_id") or "").strip()
+        if channel_arg:
+            for ch in await guild.fetch_channels():
+                if ch.id == int(channel_arg):
+                    target_channel = ch
+                    break
+            if target_channel is None:
+                return [TextContent(type="text", text=f"No channel with ID {channel_arg} found in this server.")]
+
         members = []
         async for member in guild.fetch_members(limit=limit):
+            if target_role is not None and target_role not in member.roles:
+                continue
+            if target_channel is not None and not target_channel.permissions_for(member).view_channel:
+                continue
+            is_default_avatar = member.avatar is None and member.guild_avatar is None
             members.append({
                 "id": str(member.id),
                 "name": member.name,
-                "nick": member.nick,
-                "joined_at": member.joined_at.isoformat() if member.joined_at else None,
-                "roles": [str(role.id) for role in member.roles[1:]]  # Skip @everyone
+                "display": member.display_name,       # guild nick → global name → username
+                "bot": member.bot,
+                "roles": [role.name for role in member.roles[1:]],  # Skip @everyone
+                "avatar": _sized(member.display_avatar),            # guild avatar if set, else global/default
+                "default_avatar": is_default_avatar,
             })
-        
-        return [TextContent(
-            type="text",
-            text=f"Server Members ({len(members)}):\n" + 
-                 "\n".join(f"{m['name']} (ID: {m['id']}, Roles: {', '.join(m['roles'])})" for m in members)
-        )]
+
+        scope = "Server Members"
+        if target_role is not None:
+            scope = f"Members with role '{target_role.name}'"
+        if target_channel is not None:
+            scope = (scope if target_role is not None else "Members") + f" in #{target_channel.name}"
+
+        lines = [f"{scope} ({len(members)}):"]
+        for m in members:
+            tag = " [bot]" if m["bot"] else ""
+            roles = ", ".join(m["roles"]) or "—"
+            av = m["avatar"] + (" (default placeholder)" if m["default_avatar"] else "")
+            lines.append(f"{m['display']}{tag} (@{m['name']}, ID: {m['id']}) | roles: {roles} | avatar: {av}")
+
+        return [TextContent(type="text", text="\n".join(lines))]
 
     # Role Management Tools
     elif name == "add_role":
