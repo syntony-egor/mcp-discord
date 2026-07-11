@@ -22,11 +22,23 @@ if not DISCORD_TOKEN:
 # Default server ID (can be overridden with environment variable)
 DEFAULT_SERVER_ID = os.getenv("DEFAULT_SERVER_ID")
 
-# Initialize Discord bot with necessary intents
+# Presence: connect INVISIBLE only when explicitly opted in via MCP_DISCORD_CONNECT_INVISIBLE.
+# Muraveynik's launchers set it so that merely having the gateway connection alive (any session that
+# spawns this server) does NOT light the bot up — presence is then driven by the set_presence tool
+# (the responder turns it online on start, invisible on stop). Other consumers of this SHARED server
+# that don't set the flag keep discord.py's default (online), so this never silently darkens a peer bot.
+_CONNECT_INVISIBLE = os.getenv("MCP_DISCORD_CONNECT_INVISIBLE", "").strip().lower() in ("1", "true", "yes", "on")
+_initial_status = discord.Status.invisible if _CONNECT_INVISIBLE else discord.Status.online
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, status=_initial_status)
+
+# Desired presence, re-asserted on every (re-)connect (see on_ready/on_resumed). A full gateway
+# re-IDENTIFY otherwise falls back to the IDENTIFY-time status, silently dropping a later set_presence;
+# set_presence updates this dict so the re-assert keeps the dot correct while the client stays alive.
+_desired_presence = {"status": _initial_status, "activity": None}
 
 # Initialize MCP server
 app = Server("discord-server")
@@ -61,11 +73,27 @@ def _stop_typing(channel_id: int):
         t.cancel()
 
 
+async def _reassert_presence(reason: str):
+    try:
+        await bot.change_presence(**_desired_presence)
+    except Exception as e:
+        logger.warning(f"could not re-assert presence on {reason}: {e}")
+
+
 @bot.event
 async def on_ready():
     global discord_client
     discord_client = bot
+    # on_ready fires on every READY (including reconnect / re-IDENTIFY), where the gateway would
+    # otherwise re-send the IDENTIFY-time status and lose a later set_presence — so re-assert here.
+    await _reassert_presence("ready")
     logger.info(f"Logged in as {bot.user.name}")
+
+
+@bot.event
+async def on_resumed():
+    # A RESUME normally preserves live presence; re-assert defensively in case it was reset.
+    await _reassert_presence("resume")
 
 # Helper function to ensure Discord client is ready
 def require_discord_client(func):
@@ -395,6 +423,25 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="set_presence",
+            description="Set the bot's account-wide presence (the online/offline dot). When the server is started with MCP_DISCORD_CONNECT_INVISIBLE, the bot connects invisible and stays dark until this is called. Use 'online' when the bot is actively present/listening and 'invisible' to make it appear offline (while staying connected). Optional activity_text shows a custom status line under the name. The last-set value is re-asserted across reconnects.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["online", "idle", "dnd", "invisible"],
+                        "description": "Presence status: online (green), idle (yellow), dnd (red), invisible (appears offline while still connected)."
+                    },
+                    "activity_text": {
+                        "type": "string",
+                        "description": "Optional custom status text shown under the bot's name (omit or empty to clear it)."
+                    }
+                },
+                "required": ["status"]
+            }
+        ),
+        Tool(
             name="add_multiple_reactions",
             description="Add multiple reactions to a message",
             inputSchema={
@@ -522,7 +569,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_user_info",
-            description="Get information about a Discord user",
+            description="Get information about a Discord user, including their avatar/banner CDN URLs (download the returned Avatar URL with download_attachment).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -716,6 +763,30 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             text=f"Typing indicator stopped in channel {cid}"
         )]
 
+    elif name == "set_presence":
+        status_map = {
+            "online": discord.Status.online,
+            "idle": discord.Status.idle,
+            "dnd": discord.Status.dnd,
+            "invisible": discord.Status.invisible,
+        }
+        status_key = arguments["status"]
+        status = status_map.get(status_key)
+        if status is None:
+            raise ValueError(f"Unknown status: {status_key!r} (expected one of {list(status_map)})")
+        activity_text = (arguments.get("activity_text") or "").strip()
+        activity = discord.CustomActivity(name=activity_text) if activity_text else None
+        # Remember it so on_ready/on_resumed can re-assert after a reconnect (re-IDENTIFY otherwise
+        # reverts to the connect-time status and silently drops this).
+        _desired_presence["status"] = status
+        _desired_presence["activity"] = activity
+        await discord_client.change_presence(status=status, activity=activity)
+        suffix = f" with activity {activity_text!r}" if activity_text else ""
+        return [TextContent(
+            type="text",
+            text=f"Presence set to {status_key}{suffix}"
+        )]
+
     elif name == "send_file":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         file_path = arguments["file_path"]
@@ -810,20 +881,33 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "get_user_info":
         user = await discord_client.fetch_user(int(arguments["user_id"]))
-        user_info = {
-            "id": str(user.id),
-            "name": user.name,
-            "discriminator": user.discriminator,
-            "bot": user.bot,
-            "created_at": user.created_at.isoformat()
-        }
+
+        def _sized(asset, size=1024):
+            # Asset.with_size sets ?size=; harmless on default avatars (CDN ignores it).
+            try:
+                return asset.with_size(size).url
+            except Exception:
+                return asset.url
+
+        # display_avatar always resolves (custom avatar, or Discord's default placeholder).
+        # `user.avatar` is None when the user has no custom avatar; `user.banner` needs a full
+        # fetch_user (which we did) and is None when unset. URLs point at the public CDN, so
+        # anyone can download them without a token once the hash is known.
+        display_avatar_url = _sized(user.display_avatar)
+        custom_avatar_url = _sized(user.avatar) if user.avatar else None
+        banner_url = _sized(user.banner) if user.banner else None
+
         return [TextContent(
             type="text",
-            text=f"User information:\n" + 
-                 f"Name: {user_info['name']}#{user_info['discriminator']}\n" +
-                 f"ID: {user_info['id']}\n" +
-                 f"Bot: {user_info['bot']}\n" +
-                 f"Created: {user_info['created_at']}"
+            text="User information:\n" +
+                 f"Name: {user.name}#{user.discriminator}\n" +
+                 f"Global name: {user.global_name or '-'}\n" +
+                 f"ID: {user.id}\n" +
+                 f"Bot: {user.bot}\n" +
+                 f"Created: {user.created_at.isoformat()}\n" +
+                 f"Avatar URL: {display_avatar_url}\n" +
+                 f"Custom avatar: {custom_avatar_url or '(none — using Discord default)'}\n" +
+                 f"Banner URL: {banner_url or '(none)'}"
         )]
 
     elif name == "moderate_message":
@@ -1319,6 +1403,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.fetch_message(int(arguments["message_id"]))
         await message.add_reaction(arguments["emoji"])
+        _stop_typing(int(arguments["channel_id"]))   # a reaction is a reply too → stop the typing loop
         return [TextContent(
             type="text",
             text=f"Added reaction {arguments['emoji']} to message"
@@ -1329,6 +1414,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         message = await channel.fetch_message(int(arguments["message_id"]))
         for emoji in arguments["emojis"]:
             await message.add_reaction(emoji)
+        _stop_typing(int(arguments["channel_id"]))   # a reaction is a reply too → stop the typing loop
         return [TextContent(
             type="text",
             text=f"Added reactions: {', '.join(arguments['emojis'])} to message"
