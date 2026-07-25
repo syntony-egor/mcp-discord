@@ -516,6 +516,30 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="edit_message",
+            description=("Edit a message the bot itself posted earlier (Discord allows editing only own "
+                         "messages). Replaces the whole content. Used to keep a channel-side digest of a "
+                         "thread conversation up to date."),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "ID of the channel (or thread) the message lives in"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "ID of the bot's own message to edit"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New full message content (replaces the old one)"
+                    }
+                },
+                "required": ["channel_id", "message_id", "content"]
+            }
+        ),
+        Tool(
             name="send_file",
             description="Send a file (image, document, etc.) to a Discord channel",
             inputSchema={
@@ -752,6 +776,30 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         return [TextContent(
             type="text",
             text=f"Message sent successfully. Message ID: {message.id}"
+        )]
+
+    elif name == "edit_message":
+        # Own messages only — the Discord API refuses to edit anyone else's content, so a
+        # Forbidden here almost always means "that message is not ours" (not a perms gap).
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        try:
+            message = await channel.fetch_message(int(arguments["message_id"]))
+            await message.edit(content=arguments["content"])
+        except discord.NotFound:
+            return [TextContent(
+                type="text",
+                text="Error: message not found (wrong channel_id/message_id, or it was deleted)"
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Error: cannot edit that message — a bot may only edit messages it posted itself"
+            )]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error editing message: {str(e)}")]
+        return [TextContent(
+            type="text",
+            text=f"Message edited successfully. Message ID: {message.id}"
         )]
 
     elif name == "start_typing":

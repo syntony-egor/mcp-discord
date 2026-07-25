@@ -5,10 +5,16 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gi
 This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)** (originally by Jawad Bly), with extra tools added for richer agent behavior:
 
 - `start_typing` / `stop_typing` — continuous "Bot is typing…" indicator
+- `set_presence` — set the bot's online/offline dot (`online` / `idle` / `dnd` / `invisible`, optional status text)
 - `send_file` — upload a local file to a channel
 - `download_attachment` — save a Discord attachment to a local path
 - `move_channel` — reposition a channel / move it between categories
 - `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
+- `edit_message` — rewrite one of the bot's own earlier messages (e.g. keep a channel-side digest of a thread current)
+
+Set `MCP_DISCORD_CONNECT_INVISIBLE=1` to make the bot **connect `invisible`**, so merely running this server does not
+light the bot up — a client then lights it with `set_presence("online")` and darkens it with `set_presence("invisible")`.
+Without the flag the bot keeps discord.py's default (online), so this never silently darkens an existing consumer.
 
 These additions are what the **[muraveynik](https://github.com/syntony-egor/muraveynik)** responder relies on (typing presence while the agent composes, exchanging images and documents) — see [Used by](#used-by).
 
@@ -103,6 +109,7 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 
 ### Messaging
 - `send_message` — send a message to a channel (`channel_id`, `content`). Also stops any active typing indicator in that channel.
+- `edit_message` *(fork addition)* — replace the content of a message **the bot itself posted** (`channel_id`, `message_id`, `content`); Discord forbids editing anyone else's message, so a `Forbidden` here means "not our message".
 - `read_messages` — read recent history (`channel_id`, `limit` ≤ 100); returns author, timestamp, content, reactions, and attachment URLs.
 
 ### Reactions
@@ -111,8 +118,11 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 - `remove_reaction` — remove the bot's own reaction.
 
 ### Typing *(fork addition)*
-- `start_typing` — start a **continuous** "typing…" indicator (auto-refreshed ~every 8 s, safety-capped at 5 min). Call it when the agent begins composing; it auto-stops on the next `send_message`.
+- `start_typing` — start a **continuous** "typing…" indicator (auto-refreshed ~every 8 s, safety-capped at 5 min). Call it when the agent begins composing; it auto-stops on the next `send_message` or reaction in that channel.
 - `stop_typing` — stop it manually (rarely needed).
+
+### Presence *(fork addition)*
+- `set_presence` — set the bot's account-wide presence dot: `status` = `online` / `idle` / `dnd` / `invisible`, plus optional `activity_text` for a custom status line. With `MCP_DISCORD_CONNECT_INVISIBLE=1` the bot **connects `invisible`** and stays dark until a client sets it `online`; use `invisible` to make it appear offline again while staying connected. The last-set presence is re-asserted across gateway reconnects, so it survives a re-IDENTIFY.
 
 ### Files & attachments *(fork addition)*
 - `send_file` — upload a local file (`channel_id`, `file_path`, optional `content`).
@@ -144,7 +154,8 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 ## Used by
 
 This fork is a dependency of **muraveynik** (the «Садик» Discord assistant). Its responder runs from an interactive Claude Code session and posts/reacts as the "Клод" bot through this server, specifically depending on the fork-added tools:
-- `start_typing` — show presence while the agent thinks;
+- `set_presence` — the responder (with `MCP_DISCORD_CONNECT_INVISIBLE=1` set in its launcher) lights the bot `online` on start and `invisible` on stop, so the online dot reflects "the responder is live";
+- `start_typing` — the orchestrator shows "typing…" the instant a human ping arrives, so it's visible while the agent composes;
 - `send_file` / `download_attachment` — exchange images and documents.
 
 The upstream `netixc/mcp-discord` lacks these, so muraveynik pins this fork.
