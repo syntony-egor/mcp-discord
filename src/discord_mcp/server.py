@@ -271,6 +271,37 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="create_forum_post",
+            description="Create a new post in a forum channel (a thread with its initial message, optionally with a file attached)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "ID of the forum channel to create the post in"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Title of the post (max 100 characters)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text of the post's initial message (max 2000 characters)"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional path to a file (e.g. an image) to attach to the initial message"
+                    },
+                    "auto_archive_duration": {
+                        "type": "number",
+                        "description": "Duration in minutes before the post's thread will archive. Must be one of: 60, 1440, 4320, 10080",
+                        "enum": [60, 1440, 4320, 10080]
+                    }
+                },
+                "required": ["channel_id", "name", "content"]
+            }
+        ),
+        Tool(
             name="set_channel_permissions",
             description="Set permissions for a channel",
             inputSchema={
@@ -1230,7 +1261,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             if not isinstance(channel, discord.TextChannel):
                 return [TextContent(
                     type="text",
-                    text="Error: The specified channel is not a text channel. Only text channels can have threads."
+                    text="Error: The specified channel is not a text channel. Only text channels can have threads. For forum channels use create_forum_post."
                 )]
             
             thread_name = arguments["name"]
@@ -1269,7 +1300,46 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 type="text",
                 text=f"Error creating thread: {str(e)}"
             )]
-            
+
+    elif name == "create_forum_post":
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+
+            if not isinstance(channel, discord.ForumChannel):
+                return [TextContent(
+                    type="text",
+                    text="Error: The specified channel is not a forum channel. For text channels use create_thread."
+                )]
+
+            kwargs = {
+                "name": arguments["name"],
+                "content": arguments["content"],
+                "auto_archive_duration": int(arguments.get("auto_archive_duration", 10080)),
+            }
+            if arguments.get("file_path"):
+                kwargs["file"] = discord.File(arguments["file_path"])
+
+            thread, message = await channel.create_thread(**kwargs)
+            return [TextContent(
+                type="text",
+                text=f"Created forum post '{thread.name}' (thread ID: {thread.id}, message ID: {message.id}) in #{channel.name}"
+            )]
+        except FileNotFoundError:
+            return [TextContent(
+                type="text",
+                text=f"Error: File not found: {arguments.get('file_path')}"
+            )]
+        except discord.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Error: The bot does not have permissions to create posts in this forum channel."
+            )]
+        except discord.HTTPException as e:
+            return [TextContent(
+                type="text",
+                text=f"Error creating forum post: {str(e)}"
+            )]
+
     elif name == "set_channel_permissions":
         try:
             channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
