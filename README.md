@@ -7,6 +7,7 @@ This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)*
 - `start_typing` / `stop_typing` — continuous "Bot is typing…" indicator
 - `set_presence` — set the bot's online/offline dot (`online` / `idle` / `dnd` / `invisible`, optional status text)
 - `send_file` — upload a local file to a channel
+- `send_voice_message` — send a NATIVE voice message (waveform bubble; any audio in, ffmpeg required)
 - `download_attachment` — save a Discord attachment to a local path
 - `move_channel` — reposition a channel / move it between categories
 - `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
@@ -126,6 +127,10 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 
 ### Files & attachments *(fork addition)*
 - `send_file` — upload a local file (`channel_id`, `file_path`, optional `content`).
+- `send_voice_message` — native voice message (`channel_id`, `file_path`). Uses the cloud-attachment
+  upload flow + `flags=8192`, so it renders as a voice bubble rather than an audio attachment; the
+  input is transcoded to ogg/opus and the waveform measured with **ffmpeg** (required). Voice
+  messages carry no text — send words separately.
 - `download_attachment` — download an attachment URL (from `read_messages`) to a local `output_path`.
 
 ### Server & user info

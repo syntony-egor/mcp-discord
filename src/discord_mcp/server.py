@@ -40,6 +40,100 @@ bot = commands.Bot(command_prefix="!", intents=intents, status=_initial_status)
 # set_presence updates this dict so the re-assert keeps the dot correct while the client stays alive.
 _desired_presence = {"status": _initial_status, "activity": None}
 
+
+# ---- Voice messages (native) -------------------------------------------------------------------
+# A Discord voice message is NOT a plain attachment: it needs the cloud-attachment upload flow
+# (POST /channels/:id/attachments → PUT to the returned URL → POST /messages referencing it) plus
+# flags=8192 (IS_VOICE_MESSAGE), duration_secs and a waveform. Sending the same file through
+# multipart (discord.File) yields an ordinary audio attachment instead. Requires ffmpeg: any input
+# audio is transcoded to the ogg/opus Discord clients expect, and the waveform is measured from PCM.
+_VOICE_FLAG = 1 << 13          # 8192, IS_VOICE_MESSAGE
+_WAVEFORM_MAX = 256            # Discord caps the waveform at 256 bytes
+
+
+def _voice_encode(file_path: str):
+    """Any audio file → (ogg/opus bytes, duration_secs, base64 waveform). Runs ffmpeg twice."""
+    import base64
+    import subprocess
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as t:
+        ogg_path = t.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", file_path, "-ac", "1", "-ar", "48000",
+             "-c:a", "libopus", "-b:a", "32k", "-y", ogg_path],
+            capture_output=True, check=True,
+        )
+        ogg = _P(ogg_path).read_bytes()
+    finally:
+        _P(ogg_path).unlink(missing_ok=True)
+
+    # Waveform: peak amplitude per bin over 8 kHz mono PCM (that is all the client renders).
+    pcm = subprocess.run(
+        ["ffmpeg", "-i", file_path, "-ac", "1", "-ar", "8000", "-f", "s16le", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    n_samples = len(pcm) // 2
+    duration = round(n_samples / 8000, 2)
+    bins = max(1, min(_WAVEFORM_MAX, int(duration * 10) or 1))
+    step = max(1, n_samples // bins)
+    peaks = []
+    for i in range(0, n_samples, step):
+        chunk = pcm[i * 2:(i + step) * 2]
+        peak = 0
+        for j in range(0, len(chunk) - 1, 2):
+            v = int.from_bytes(chunk[j:j + 2], "little", signed=True)
+            peak = max(peak, abs(v))
+        peaks.append(min(255, peak * 255 // 32767))
+        if len(peaks) >= bins:
+            break
+    return ogg, duration, base64.b64encode(bytes(peaks or [0])).decode()
+
+
+async def _send_voice_message(channel_id: int, file_path: str, waveform_b64=None, duration=None):
+    """Upload + post a native voice message; returns the message id."""
+    import aiohttp
+
+    ogg, dur, wf = _voice_encode(file_path)
+    duration = duration or dur
+    waveform_b64 = waveform_b64 or wf
+    api = "https://discord.com/api/v10"
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
+    filename = "voice-message.ogg"
+
+    async with aiohttp.ClientSession(headers=headers) as sess:
+        # 1. reserve an upload slot
+        async with sess.post(f"{api}/channels/{channel_id}/attachments",
+                             json={"files": [{"filename": filename, "file_size": len(ogg), "id": "0"}]}) as r:
+            if r.status not in (200, 201):
+                raise RuntimeError(f"attachment slot failed ({r.status}): {(await r.text())[:300]}")
+            slot = (await r.json())["attachments"][0]
+
+        # 2. PUT the bytes to the returned (pre-signed, unauthenticated) URL
+        async with sess.put(slot["upload_url"], data=ogg,
+                            headers={"Content-Type": "audio/ogg", "Authorization": ""}) as r:
+            if r.status not in (200, 201):
+                raise RuntimeError(f"upload failed ({r.status}): {(await r.text())[:300]}")
+
+        # 3. post the message referencing the uploaded file
+        payload = {
+            "flags": _VOICE_FLAG,
+            "attachments": [{
+                "id": "0",
+                "filename": filename,
+                "uploaded_filename": slot["upload_filename"],
+                "duration_secs": duration,
+                "waveform": waveform_b64,
+            }],
+        }
+        async with sess.post(f"{api}/channels/{channel_id}/messages", json=payload) as r:
+            if r.status not in (200, 201):
+                raise RuntimeError(f"send failed ({r.status}): {(await r.text())[:300]}")
+            return (await r.json())["id"]
+
+
 # Initialize MCP server
 app = Server("discord-server")
 
@@ -593,6 +687,28 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="send_voice_message",
+            description=(
+                "Send a NATIVE Discord voice message (round waveform bubble, not a file attachment). "
+                "Takes any audio file (ogg/mp3/wav) and transcodes it; requires ffmpeg. "
+                "Voice messages carry no text — use send_message separately if you need words."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the audio file to send as a voice message"
+                    }
+                },
+                "required": ["channel_id", "file_path"]
+            }
+        ),
+        Tool(
             name="download_attachment",
             description="Download a Discord attachment to a local file",
             inputSchema={
@@ -884,6 +1000,13 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         return [TextContent(
             type="text",
             text=f"File sent successfully. Message ID: {message.id}"
+        )]
+
+    elif name == "send_voice_message":
+        message_id = await _send_voice_message(int(arguments["channel_id"]), arguments["file_path"])
+        return [TextContent(
+            type="text",
+            text=f"Voice message sent successfully. Message ID: {message_id}"
         )]
 
     elif name == "download_attachment":
