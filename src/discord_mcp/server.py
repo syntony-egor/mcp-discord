@@ -134,6 +134,99 @@ async def _send_voice_message(channel_id: int, file_path: str, waveform_b64=None
             return (await r.json())["id"]
 
 
+# ---- Custom (server) emojis --------------------------------------------------------------------
+# Discord caps an emoji image at 256 KB (and renders it ~32-64 px), so anything drawn by an image
+# model is far over the limit. Pillow downscales it here instead of failing the call — otherwise
+# every freshly generated emoji would need a manual resize round-trip first.
+_EMOJI_MAX_BYTES = 256 * 1024
+_EMOJI_SIZES = (128, 96, 64)
+
+
+async def _emoji_image_bytes(file_path=None, url=None) -> bytes:
+    """Local path or image URL -> bytes that fit Discord's emoji size cap."""
+    if file_path:
+        from pathlib import Path as _P
+        raw = _P(file_path).read_bytes()
+    elif url:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"image download failed ({r.status}): {url}")
+                raw = await r.read()
+    else:
+        raise ValueError("either file_path or url is required")
+
+    return raw if len(raw) <= _EMOJI_MAX_BYTES else _shrink_emoji_image(raw)
+
+
+def _shrink_emoji_image(raw: bytes) -> bytes:
+    """Downscale an oversized image until it fits; animated GIFs keep their frames."""
+    import io
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:
+        raise RuntimeError(
+            f"image is {len(raw) // 1024} KB, over Discord's 256 KB emoji limit, and Pillow is not "
+            "installed to shrink it — resize the file to 128x128 first"
+        )
+
+    src = Image.open(io.BytesIO(raw))
+    animated = getattr(src, "is_animated", False)
+    out = raw
+    for size in _EMOJI_SIZES:
+        buf = io.BytesIO()
+        if animated:
+            frames = []
+            for frame in ImageSequence.Iterator(src):
+                f = frame.convert("RGBA")
+                f.thumbnail((size, size), Image.LANCZOS)
+                frames.append(f)
+            frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                           loop=src.info.get("loop", 0), duration=src.info.get("duration", 100),
+                           disposal=2, optimize=True)
+        else:
+            img = src.convert("RGBA")
+            img.thumbnail((size, size), Image.LANCZOS)
+            img.save(buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+        if len(out) <= _EMOJI_MAX_BYTES:
+            return out
+    raise RuntimeError(f"could not shrink the image under 256 KB (smallest attempt: {len(out) // 1024} KB)")
+
+
+def _find_emoji(emojis, ref: str):
+    """Resolve an emoji by id, name, ':name:' or the '<:name:id>' form; None if absent."""
+    import re
+    ref = ref.strip()
+    m = re.fullmatch(r"<a?:([^:]+):(\d+)>", ref)
+    if m:
+        ref = m.group(2)
+    ref = ref.strip(":")
+    if ref.isdigit():
+        return next((e for e in emojis if str(e.id) == ref), None)
+    return next((e for e in emojis if e.name.lower() == ref.lower()), None)
+
+
+def _find_roles(guild_roles, refs):
+    """Resolve role ids or role names; raises on the first unknown one (fail loud, not silently open)."""
+    resolved = []
+    for ref in refs:
+        ref = str(ref).strip()
+        role = next((r for r in guild_roles if str(r.id) == ref or r.name.lower() == ref.lower()), None)
+        if not role:
+            raise ValueError(f"role not found: {ref}")
+        resolved.append(role)
+    return resolved
+
+
+def _emoji_line(emoji) -> str:
+    usage = f"<a:{emoji.name}:{emoji.id}>" if emoji.animated else f"<:{emoji.name}:{emoji.id}>"
+    limited = f", roles: {', '.join(r.name for r in emoji.roles)}" if emoji.roles else ""
+    kind = "animated" if emoji.animated else "static"
+    return f"{usage}  (name: {emoji.name}, ID: {emoji.id}, {kind}{limited})"
+
+
 # Initialize MCP server
 app = Server("discord-server")
 
@@ -856,6 +949,109 @@ async def list_tools() -> List[Tool]:
                     }
                 },
                 "required": []
+            }
+        ),
+        # Custom Emoji Tools
+        Tool(
+            name="list_emojis",
+            description="List the server's custom emojis. Each line carries the exact string to type in a message or pass to add_reaction (`<:name:id>`, `<a:name:id>` when animated), plus any role restriction.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="create_emoji",
+            description="Upload a new custom emoji to the server from a local image (`file_path`) or an image URL (`url`) — e.g. one just generated. Oversized images are downscaled automatically to fit Discord's 256 KB limit. Returns the `<:name:id>` string to post or react with.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Emoji name (2-32 chars, letters/digits/underscore — this is what people type between colons)"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to a local image file (PNG/JPEG/GIF). Either this or url is required."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Image URL to upload from (e.g. a Discord attachment URL). Either this or file_path is required."
+                    },
+                    "roles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: restrict use of the emoji to these roles (IDs or names). Omit to let everyone use it."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["name"]
+            }
+        ),
+        Tool(
+            name="edit_emoji",
+            description="Rename a custom emoji or change which roles may use it. Renaming changes the `<:name:id>` string, so messages that already used the old name render it with the new one.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "The emoji to edit: its ID, its name, or the '<:name:id>' form."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name (optional)"
+                    },
+                    "roles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: new role restriction (IDs or names). An empty array clears the restriction."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["emoji"]
+            }
+        ),
+        Tool(
+            name="delete_emoji",
+            description="Delete a custom emoji from the server. Irreversible: messages and reactions that used it lose the image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "The emoji to delete: its ID, its name, or the '<:name:id>' form."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["emoji"]
             }
         ),
         Tool(
@@ -1856,6 +2052,159 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 text=f"Error listing roles: {str(e)}"
             )]
     
+    # Custom Emoji Tools
+    elif name == "list_emojis":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            emojis = await guild.fetch_emojis()
+            if not emojis:
+                return [TextContent(type="text", text="No custom emojis on this server.")]
+
+            static = sum(1 for e in emojis if not e.animated)
+            animated = len(emojis) - static
+            result = f"Custom emojis ({static} static, {animated} animated):\n"
+            for emoji in sorted(emojis, key=lambda e: e.name.lower()):
+                result += "- " + _emoji_line(emoji) + "\n"
+
+            return [TextContent(
+                type="text",
+                text=result
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error listing emojis: {str(e)}"
+            )]
+
+    elif name == "create_emoji":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            image = await _emoji_image_bytes(arguments.get("file_path"), arguments.get("url"))
+
+            params = {
+                "name": arguments["name"],
+                "image": image,
+                "reason": arguments.get("reason", "Emoji created via MCP"),
+            }
+            if arguments.get("roles"):
+                params["roles"] = _find_roles(await guild.fetch_roles(), arguments["roles"])
+
+            emoji = await guild.create_custom_emoji(**params)
+
+            return [TextContent(
+                type="text",
+                text=f"Created emoji {_emoji_line(emoji)}"
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage emojis. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error creating emoji: {str(e)}"
+            )]
+
+    elif name == "edit_emoji":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            emoji = _find_emoji(await guild.fetch_emojis(), arguments["emoji"])
+            if not emoji:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: No custom emoji matching '{arguments['emoji']}' on this server."
+                )]
+
+            params = {"reason": arguments.get("reason", "Emoji edited via MCP")}
+            if "name" in arguments:
+                params["name"] = arguments["name"]
+            # An explicit empty list clears the restriction, so test for presence, not truthiness.
+            if arguments.get("roles") is not None:
+                params["roles"] = _find_roles(await guild.fetch_roles(), arguments["roles"])
+            if len(params) == 1:
+                return [TextContent(
+                    type="text",
+                    text="Error: nothing to change — pass name and/or roles."
+                )]
+
+            edited = await emoji.edit(**params)
+
+            return [TextContent(
+                type="text",
+                text=f"Edited emoji {_emoji_line(edited)}"
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage emojis. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error editing emoji: {str(e)}"
+            )]
+
+    elif name == "delete_emoji":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            emoji = _find_emoji(await guild.fetch_emojis(), arguments["emoji"])
+            if not emoji:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: No custom emoji matching '{arguments['emoji']}' on this server."
+                )]
+
+            emoji_name, emoji_id = emoji.name, emoji.id
+            await emoji.delete(reason=arguments.get("reason", "Emoji deleted via MCP"))
+
+            return [TextContent(
+                type="text",
+                text=f"Deleted emoji {emoji_name} (ID: {emoji_id})"
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage emojis. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error deleting emoji: {str(e)}"
+            )]
+
     # User Management Tools
     elif name == "kick_user":
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)

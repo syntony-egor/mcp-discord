@@ -12,6 +12,7 @@ This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)*
 - `move_channel` — reposition a channel / move it between categories
 - `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
 - `edit_message` — rewrite one of the bot's own earlier messages (e.g. keep a channel-side digest of a thread current)
+- `list_emojis` / `create_emoji` / `edit_emoji` / `delete_emoji` — manage the server's custom emojis (upload from a file or URL; oversized images are auto-resized)
 
 Set `MCP_DISCORD_CONNECT_INVISIBLE=1` to make the bot **connect `invisible`**, so merely running this server does not
 light the bot up — a client then lights it with `set_presence("online")` and darkens it with `set_presence("invisible")`.
@@ -25,7 +26,9 @@ These additions are what the **[muraveynik](https://github.com/syntony-egor/mura
 - **[uv](https://docs.astral.sh/uv/)** (package/run manager) — install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - A Discord **bot token** with the bot added to your server (see [Get a bot token](#get-a-bot-token))
 
-Runtime dependencies (resolved by uv from `uv.lock` / `pyproject.toml`): `discord.py>=2.3.0`, `mcp>=0.1.0`.
+Runtime dependencies (resolved by uv from `uv.lock` / `pyproject.toml`): `discord.py>=2.3.0`, `mcp>=0.1.0`, `pillow>=10.0.0` (downscales oversized `create_emoji` images).
+
+- **ffmpeg** — required only by `send_voice_message` (transcode + waveform).
 
 > **Python 3.13+ only:** `discord.py`'s voice support imports `audioop`, removed from the stdlib in 3.13. If you are on 3.13+, add the shim to the project: `uv add audioop-lts`. (Not needed on 3.10–3.12.)
 
@@ -150,6 +153,15 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 - `create_role`, `delete_role`, `list_roles`
 - `add_role`, `remove_role` (assign/unassign on a member)
 
+### Emojis *(fork addition)*
+- `list_emojis` — the server's custom emojis; each line gives the exact string to type in a message or pass to `add_reaction` (`<:name:id>`, `<a:name:id>` when animated) plus any role restriction.
+- `create_emoji` — upload a new emoji from a local `file_path` **or** an image `url` (e.g. a freshly generated picture, or a Discord attachment URL). Images over Discord's **256 KB** cap are downscaled to 128/96/64 px until they fit (animated GIFs keep their frames), so a 3 MB render uploads without a manual resize. Optional `roles` restricts who may use it. Returns the `<:name:id>` string.
+- `edit_emoji` — rename (`name`) and/or change the `roles` restriction; an empty `roles` array clears it.
+- `delete_emoji` — remove an emoji. Irreversible.
+
+> `edit_emoji` / `delete_emoji` take the emoji as an ID, a bare name, `:name:` or `<:name:id>`.
+> All four need the bot to have **Manage Expressions** on the server.
+
 ### Moderation / admin
 - `moderate_message` — delete a message, optionally timeout the author.
 - `kick_user`, `ban_user` (with optional message-deletion window).
@@ -171,6 +183,7 @@ The upstream `netixc/mcp-discord` lacks these, so muraveynik pins this fork.
 - **`read_messages` returns empty / no content** — **MESSAGE CONTENT INTENT** is off in the Developer Portal, or the bot lacks **Read Message History** in that channel.
 - **`list_members` errors or returns few members** — **SERVER MEMBERS INTENT** is off.
 - **"No server ID provided and no default server ID set"** — set `DEFAULT_SERVER_ID` or pass `server_id` in the call.
+- **`create_emoji` fails with "Maximum number of emojis reached"** — the server is out of emoji slots (50 at boost level 0, more per boost level); delete one with `delete_emoji` first.
 - **Forbidden / permission errors on channel/role/moderation tools** — the bot's OAuth permissions or role hierarchy are insufficient; the bot's role must sit above any role/user it manages.
 - **Python 3.13+ `audioop` import error** — run `uv add audioop-lts` in this project (do not use `uv pip install` — that targets an ad-hoc env, not the `uv sync`-managed `.venv`).
 - **Client can't launch the server** — confirm `command` is an absolute path to `uv` and `--directory` points at this checkout; test manually with `DISCORD_TOKEN=... uv --directory /path/to/mcp-discord run mcp-discord`.
