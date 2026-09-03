@@ -13,6 +13,7 @@ This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)*
 - `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
 - `edit_message` — rewrite one of the bot's own earlier messages (e.g. keep a channel-side digest of a thread current)
 - `list_emojis` / `create_emoji` / `edit_emoji` / `delete_emoji` — manage the server's custom emojis (upload from a file or URL; oversized images are auto-resized)
+- `list_stickers` / `create_sticker` / `edit_sticker` / `delete_sticker` / `send_sticker` — manage and post the server's custom stickers (auto-fitted to Discord's exact 320×320 / 512 KB)
 
 Set `MCP_DISCORD_CONNECT_INVISIBLE=1` to make the bot **connect `invisible`**, so merely running this server does not
 light the bot up — a client then lights it with `set_presence("online")` and darkens it with `set_presence("invisible")`.
@@ -162,6 +163,15 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 > `edit_emoji` / `delete_emoji` take the emoji as an ID, a bare name, `:name:` or `<:name:id>`.
 > All four need the bot to have **Manage Expressions** on the server.
 
+### Stickers *(fork addition)*
+- `list_stickers` — the server's stickers with name, ID, format, emoji tag and description, plus **slots used** (5 / 15 / 30 / 60 by boost level — far scarcer than emoji).
+- `create_sticker` — upload from a local `file_path` or an image `url`. Discord demands **exactly 320×320** and **512 KB**, so the image is padded to square (letterboxed, never squashed), resized and — for photo-like art — palette-compressed until it fits; animated GIFs become APNG. Needs `name` (2-30) and `emoji`, one unicode emoji that tags the expression (Discord stores it by its unicode *name*, e.g. `😺` → `SMILING_CAT_FACE_WITH_OPEN_MOUTH`); `description` is optional.
+- `edit_sticker` — change `name`, `description` and/or `emoji` tag.
+- `delete_sticker` — remove a sticker. Irreversible.
+- `send_sticker` — post a sticker to a channel (by ID, or by name on this server), with optional `content` in the same message. Stickers cannot be typed inline the way emojis can, so `send_message` will not do it.
+
+> Stickers are **not** big emojis: different endpoint, different limits, and they ride the message rather than sitting in its text.
+
 ### Moderation / admin
 - `moderate_message` — delete a message, optionally timeout the author.
 - `kick_user`, `ban_user` (with optional message-deletion window).
@@ -183,6 +193,7 @@ The upstream `netixc/mcp-discord` lacks these, so muraveynik pins this fork.
 - **`read_messages` returns empty / no content** — **MESSAGE CONTENT INTENT** is off in the Developer Portal, or the bot lacks **Read Message History** in that channel.
 - **`list_members` errors or returns few members** — **SERVER MEMBERS INTENT** is off.
 - **"No server ID provided and no default server ID set"** — set `DEFAULT_SERVER_ID` or pass `server_id` in the call.
+- **`create_sticker` fails with "Maximum number of stickers reached"** — sticker slots are much scarcer than emoji ones (5 unboosted, 30 at boost level 2); `list_stickers` shows the count.
 - **`create_emoji` fails with "Maximum number of emojis reached"** — the server is out of emoji slots (50 at boost level 0, more per boost level); delete one with `delete_emoji` first.
 - **Forbidden / permission errors on channel/role/moderation tools** — the bot's OAuth permissions or role hierarchy are insufficient; the bot's role must sit above any role/user it manages.
 - **Python 3.13+ `audioop` import error** — run `uv add audioop-lts` in this project (do not use `uv pip install` — that targets an ad-hoc env, not the `uv sync`-managed `.venv`).

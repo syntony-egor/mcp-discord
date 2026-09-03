@@ -142,21 +142,24 @@ _EMOJI_MAX_BYTES = 256 * 1024
 _EMOJI_SIZES = (128, 96, 64)
 
 
-async def _emoji_image_bytes(file_path=None, url=None) -> bytes:
-    """Local path or image URL -> bytes that fit Discord's emoji size cap."""
+async def _read_image_source(file_path=None, url=None) -> bytes:
+    """Local path or image URL -> raw bytes. Shared by the emoji and sticker uploaders."""
     if file_path:
         from pathlib import Path as _P
-        raw = _P(file_path).read_bytes()
-    elif url:
+        return _P(file_path).read_bytes()
+    if url:
         import aiohttp
         async with aiohttp.ClientSession() as sess:
             async with sess.get(url) as r:
                 if r.status != 200:
                     raise RuntimeError(f"image download failed ({r.status}): {url}")
-                raw = await r.read()
-    else:
-        raise ValueError("either file_path or url is required")
+                return await r.read()
+    raise ValueError("either file_path or url is required")
 
+
+async def _emoji_image_bytes(file_path=None, url=None) -> bytes:
+    """Local path or image URL -> bytes that fit Discord's emoji size cap."""
+    raw = await _read_image_source(file_path, url)
     return raw if len(raw) <= _EMOJI_MAX_BYTES else _shrink_emoji_image(raw)
 
 
@@ -225,6 +228,70 @@ def _emoji_line(emoji) -> str:
     limited = f", roles: {', '.join(r.name for r in emoji.roles)}" if emoji.roles else ""
     kind = "animated" if emoji.animated else "static"
     return f"{usage}  (name: {emoji.name}, ID: {emoji.id}, {kind}{limited})"
+
+
+# ---- Stickers ----------------------------------------------------------------------------------
+# Stickers are NOT big emojis: Discord demands exactly 320x320 (not "at most"), allows 512 KB, and
+# requires a name + description + a unicode emoji tag. So the emoji fitter cannot be reused — it
+# thumbnails to "no larger than", which leaves a non-square image the sticker endpoint rejects.
+_STICKER_MAX_BYTES = 512 * 1024
+_STICKER_SIDE = 320
+
+
+def _fit_sticker_image(raw: bytes) -> bytes:
+    """Any image -> exactly 320x320 PNG (APNG when animated) under Discord's 512 KB sticker cap."""
+    import io
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:
+        raise RuntimeError(
+            f"image is {len(raw) // 1024} KB / not 320x320, and Pillow is not installed to fit it — "
+            "resize it to exactly 320x320 first"
+        )
+
+    def square(frame):
+        """Pad to square THEN resize, so a non-square source is letterboxed instead of squashed."""
+        f = frame.convert("RGBA")
+        side = max(f.size)
+        canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        canvas.alpha_composite(f, ((side - f.width) // 2, (side - f.height) // 2))
+        return canvas.resize((_STICKER_SIDE, _STICKER_SIDE), Image.LANCZOS)
+
+    src = Image.open(io.BytesIO(raw))
+    if len(raw) <= _STICKER_MAX_BYTES and src.size == (_STICKER_SIDE, _STICKER_SIDE):
+        return raw                                   # already conformant — do not re-encode
+
+    buf = io.BytesIO()
+    if getattr(src, "is_animated", False):
+        frames = [square(f) for f in ImageSequence.Iterator(src)]
+        frames[0].save(buf, format="PNG", save_all=True, append_images=frames[1:],
+                       loop=src.info.get("loop", 0), duration=src.info.get("duration", 100))
+    else:
+        square(src).save(buf, format="PNG", optimize=True)
+    out = buf.getvalue()
+    if len(out) > _STICKER_MAX_BYTES:
+        # Last resort for photo-like art: 8-bit palette keeps 320x320 (mandatory) and drops the bytes.
+        buf = io.BytesIO()
+        square(src).convert("RGBA").quantize(colors=128, method=Image.Quantize.FASTOCTREE).save(
+            buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+    if len(out) > _STICKER_MAX_BYTES:
+        raise RuntimeError(f"could not fit the sticker under 512 KB (smallest attempt: {len(out) // 1024} KB)")
+    return out
+
+
+def _find_sticker(stickers, ref: str):
+    """Resolve a sticker by id or name; None if absent."""
+    ref = ref.strip()
+    if ref.isdigit():
+        return next((s for s in stickers if str(s.id) == ref), None)
+    return next((s for s in stickers if s.name.lower() == ref.lower()), None)
+
+
+def _sticker_line(sticker) -> str:
+    tag = f", tag: {sticker.emoji}" if sticker.emoji else ""
+    desc = f" — {sticker.description}" if sticker.description else ""
+    return f"{sticker.name} (ID: {sticker.id}, {sticker.format.name}{tag}){desc}"
 
 
 # Initialize MCP server
@@ -1052,6 +1119,141 @@ async def list_tools() -> List[Tool]:
                     }
                 },
                 "required": ["emoji"]
+            }
+        ),
+        # Sticker Tools
+        Tool(
+            name="list_stickers",
+            description="List the server's custom stickers (name, ID, format, emoji tag, description) and how many sticker slots are used.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="create_sticker",
+            description="Upload a new custom sticker to the server from a local image (`file_path`) or an image URL (`url`). Discord requires exactly 320x320 and 512 KB — images are padded to square, resized and compressed automatically. Stickers are sent with send_sticker, not typed like emojis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Sticker name (2-30 characters)"
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "One unicode emoji that tags the sticker's expression (e.g. '😺'); required by Discord and used by the sticker picker's search."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Sticker description, up to 100 characters (optional)"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to a local image (PNG; APNG for animated). Either this or url is required."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Image URL to upload from. Either this or file_path is required."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["name", "emoji"]
+            }
+        ),
+        Tool(
+            name="edit_sticker",
+            description="Rename a custom sticker or change its description / emoji tag.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "sticker": {
+                        "type": "string",
+                        "description": "The sticker to edit: its ID or its name."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name (optional)"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description (optional)"
+                    },
+                    "emoji": {
+                        "type": "string",
+                        "description": "New unicode emoji tag (optional)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["sticker"]
+            }
+        ),
+        Tool(
+            name="delete_sticker",
+            description="Delete a custom sticker from the server. Irreversible.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "sticker": {
+                        "type": "string",
+                        "description": "The sticker to delete: its ID or its name."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason (optional)"
+                    }
+                },
+                "required": ["sticker"]
+            }
+        ),
+        Tool(
+            name="send_sticker",
+            description="Send a sticker to a channel. Stickers cannot be typed inside message text like emojis — they ride along with the message, so use this instead of send_message (optional `content` puts text in the same message).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to send to"
+                    },
+                    "sticker": {
+                        "type": "string",
+                        "description": "Sticker to send: its ID, or its name on this server."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Optional text sent in the same message"
+                    },
+                    "server_id": {
+                        "type": "string",
+                        "description": "Server to resolve a sticker NAME against. If not provided, the default server ID will be used."
+                    }
+                },
+                "required": ["channel_id", "sticker"]
             }
         ),
         Tool(
@@ -2203,6 +2405,193 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             return [TextContent(
                 type="text",
                 text=f"Error deleting emoji: {str(e)}"
+            )]
+
+    # Sticker Tools
+    elif name == "list_stickers":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            stickers = await guild.fetch_stickers()
+            if not stickers:
+                return [TextContent(
+                    type="text",
+                    text=f"No custom stickers on this server (0 of {guild.sticker_limit} slots used)."
+                )]
+
+            result = f"Custom stickers ({len(stickers)} of {guild.sticker_limit} slots used):\n"
+            for sticker in sorted(stickers, key=lambda s: s.name.lower()):
+                result += "- " + _sticker_line(sticker) + "\n"
+
+            return [TextContent(
+                type="text",
+                text=result
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error listing stickers: {str(e)}"
+            )]
+
+    elif name == "create_sticker":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            import io
+            raw = await _read_image_source(arguments.get("file_path"), arguments.get("url"))
+            image = _fit_sticker_image(raw)
+
+            sticker = await guild.create_sticker(
+                name=arguments["name"],
+                description=arguments.get("description", ""),
+                emoji=arguments["emoji"],
+                file=discord.File(io.BytesIO(image), filename="sticker.png"),
+                reason=arguments.get("reason", "Sticker created via MCP"),
+            )
+
+            return [TextContent(
+                type="text",
+                text=f"Created sticker {_sticker_line(sticker)}. Send it with send_sticker."
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage stickers. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error creating sticker: {str(e)}"
+            )]
+
+    elif name == "edit_sticker":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            sticker = _find_sticker(await guild.fetch_stickers(), arguments["sticker"])
+            if not sticker:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: No sticker matching '{arguments['sticker']}' on this server."
+                )]
+
+            params = {"reason": arguments.get("reason", "Sticker edited via MCP")}
+            for field in ("name", "description", "emoji"):
+                if field in arguments:
+                    params[field] = arguments[field]
+            if len(params) == 1:
+                return [TextContent(
+                    type="text",
+                    text="Error: nothing to change — pass name, description and/or emoji."
+                )]
+
+            edited = await sticker.edit(**params)
+
+            return [TextContent(
+                type="text",
+                text=f"Edited sticker {_sticker_line(edited)}"
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage stickers. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error editing sticker: {str(e)}"
+            )]
+
+    elif name == "delete_sticker":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            sticker = _find_sticker(await guild.fetch_stickers(), arguments["sticker"])
+            if not sticker:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: No sticker matching '{arguments['sticker']}' on this server."
+                )]
+
+            sticker_name, sticker_id = sticker.name, sticker.id
+            await sticker.delete(reason=arguments.get("reason", "Sticker deleted via MCP"))
+
+            return [TextContent(
+                type="text",
+                text=f"Deleted sticker {sticker_name} (ID: {sticker_id})"
+            )]
+        except discord.errors.Forbidden:
+            return [TextContent(
+                type="text",
+                text="Bot doesn't have permission to manage stickers. It needs the 'Manage Expressions' permission on this server."
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error deleting sticker: {str(e)}"
+            )]
+
+    elif name == "send_sticker":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        ref = str(arguments["sticker"]).strip()
+
+        try:
+            if ref.isdigit():
+                # A bare ID may be any sticker the bot can use, not only this guild's.
+                sticker = await discord_client.fetch_sticker(int(ref))
+            else:
+                server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+                if not server_id:
+                    return [TextContent(
+                        type="text",
+                        text="Error: sticker given by name needs a server to resolve against — set DEFAULT_SERVER_ID or pass server_id."
+                    )]
+                guild = await discord_client.fetch_guild(int(server_id))
+                sticker = _find_sticker(await guild.fetch_stickers(), ref)
+                if not sticker:
+                    return [TextContent(
+                        type="text",
+                        text=f"Error: No sticker matching '{ref}' on this server."
+                    )]
+
+            message = await channel.send(content=arguments.get("content") or None, stickers=[sticker])
+            _stop_typing(int(arguments["channel_id"]))   # a sticker is a reply too → stop the typing loop
+            return [TextContent(
+                type="text",
+                text=f"Sticker {sticker.name} sent. Message ID: {message.id}"
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Error sending sticker: {str(e)}"
             )]
 
     # User Management Tools
