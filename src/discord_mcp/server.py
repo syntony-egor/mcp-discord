@@ -348,6 +348,95 @@ def _unassignable_reason(role, me) -> Optional[str]:
     return None
 
 
+# ---- Channels ----------------------------------------------------------------------------------
+# Creating and renaming a channel is cheap and reversible; DELETING one is not — its messages go
+# with it and Discord offers no undo. So every write here names what it is about to touch (kind,
+# id, category) and refuses with the actual cause instead of the bare 403 Discord returns, while
+# list_channels shows the whole tree with a ✅/✋ mark so the caller sees the ground before moving.
+# NOTE: a fetched Guild has no channel cache (guild.get_channel is always None there) — every
+# channel lookup goes through `await guild.fetch_channels()`, same as get_server_info does.
+
+_CHANNEL_KINDS = {                    # discord.ChannelType.name -> what we call it in tool output
+    "text": "text", "voice": "voice", "forum": "forum", "category": "category",
+    "news": "announcement", "stage_voice": "stage", "media": "media",
+    "news_thread": "thread", "public_thread": "thread", "private_thread": "thread",
+}
+_KIND_ICON = {"text": "#", "announcement": "📣", "voice": "🔊", "stage": "🎙", "forum": "🗂",
+              "media": "🖼", "category": "▸", "thread": "🧵"}
+# What create_channel can make. Everything else (stage, announcement, media) is rare enough that
+# Егор makes it by hand — a wrong guess here would be a channel nobody asked for.
+_CREATABLE = ("text", "voice", "forum")
+
+
+def _channel_kind(channel) -> str:
+    name = getattr(getattr(channel, "type", None), "name", None) or str(getattr(channel, "type", "?"))
+    return _CHANNEL_KINDS.get(name, name)
+
+
+def _resolve_channel(channels, ref: str):
+    """'123…' | '#имя' | подстрока → channel or None (same id-or-name idiom as _resolve_role).
+
+    `channels` is the list from guild.fetch_channels() — see the note above about the empty cache.
+    """
+    ref = (ref or "").strip().lstrip("#")
+    if not ref:
+        return None
+    if ref.isdigit():
+        return next((c for c in channels if c.id == int(ref)), None)
+    low = ref.lower()
+    exact = next((c for c in channels if c.name.lower() == low), None)
+    return exact or next((c for c in channels if low in c.name.lower()), None)
+
+
+def _is_private(channel) -> bool:
+    """True when @everyone cannot see the channel (an explicit view_channel=False overwrite)."""
+    try:
+        ow = channel.overwrites_for(channel.guild.default_role)
+        return ow.view_channel is False
+    except Exception:
+        return False
+
+
+def _unmanageable_reason(channel, me) -> Optional[str]:
+    """Why we cannot create/rename/move/delete inside this channel, or None when we can.
+
+    Checked before the call so the caller gets the cause instead of a 403 to guess at. A channel
+    overwrite can take Manage Channels away inside one channel even when the bot has it server-wide,
+    so the per-channel view (permissions_for) is the authority and the guild-wide one only explains.
+    """
+    try:
+        perms = channel.permissions_for(me)
+    except Exception:                       # no member/overwrite data → fall back to guild-wide
+        perms = me.guild_permissions
+    if perms.administrator or perms.manage_channels:
+        return None
+    if not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
+        return "I don't have the 'Manage Channels' permission in this server."
+    return (f"my permissions are overridden inside '{channel.name}' — this channel denies me "
+            "'Manage Channels', so only a server admin can change it "
+            "(Channel Settings → Permissions).")
+
+
+def _protected_reason(channel, guild) -> Optional[str]:
+    """Channels Discord itself refuses to delete — named up front instead of coming back as a 403."""
+    for attr, what in (("rules_channel", "the rules channel"),
+                       ("public_updates_channel", "the moderator-updates channel")):
+        c = getattr(guild, attr, None)
+        if c is not None and c.id == channel.id:
+            return (f"'{channel.name}' is {what} of this Community server — Discord does not allow "
+                    "deleting it while Community is enabled (Server Settings → Community).")
+    return None
+
+
+def _channel_line(channel, me, indent="  ") -> str:
+    """One tree line: icon, name, kind, id, 🔒 when private, ✅/✋ manageability with its cause."""
+    kind = _channel_kind(channel)
+    blocked = _unmanageable_reason(channel, me)
+    mark = "✋ " + blocked if blocked else "✅"
+    lock = " 🔒 private" if _is_private(channel) else ""
+    return f"{indent}{_KIND_ICON.get(kind, '·')} {channel.name} ({kind}, ID: {channel.id}){lock} {mark}"
+
+
 # Initialize MCP server
 app = Server("discord-server")
 
@@ -534,8 +623,22 @@ async def list_tools() -> List[Tool]:
 
         # Channel Management Tools
         Tool(
-            name="create_text_channel",
-            description="Create a new text channel",
+            name="list_channels",
+            description="List the server's channels as a tree (categories, then the channels inside them) with each channel's kind, ID, whether it is private, and whether I can manage it. Unlike get_server_info this also shows forum channels and says up front what I can and cannot change.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="create_channel",
+            description="Create a channel: text (default), voice or forum. Requires Manage Channels.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -545,15 +648,28 @@ async def list_tools() -> List[Tool]:
                     },
                     "name": {
                         "type": "string",
-                        "description": "Channel name"
+                        "description": "Channel name. Discord lowercases text/forum names and turns spaces into dashes — the tool reports the name it actually got."
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Kind of channel to create (default: text)",
+                        "enum": ["text", "voice", "forum"]
                     },
                     "category_id": {
                         "type": "string",
-                        "description": "Optional category ID to place channel in"
+                        "description": "Optional category ID to place the channel in"
                     },
                     "topic": {
                         "type": "string",
-                        "description": "Optional channel topic"
+                        "description": "Optional channel topic (text and forum channels only)"
+                    },
+                    "private": {
+                        "type": "boolean",
+                        "description": "If true, @everyone cannot see the channel (default: false). Open it up for a specific role afterwards with set_channel_permissions."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional audit-log reason (say who asked)"
                     }
                 },
                 "required": ["name"]
@@ -561,7 +677,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="delete_channel",
-            description="Delete a channel",
+            description="Delete a channel PERMANENTLY, together with its messages — Discord has no undo. Deleting a category does not delete the channels inside it; they just lose their category. Requires Manage Channels.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -693,24 +809,32 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="edit_channel",
-            description="Rename a channel (e.g. change the leading emoji of a diary). Requires Manage Channels.",
+            description="Change a channel's name, topic (description) or slowmode. Pass only what you want changed. Requires Manage Channels. Discord allows 2 such edits per channel per 10 minutes.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
-                        "description": "ID of the channel to rename"
+                        "description": "ID of the channel to edit"
                     },
                     "name": {
                         "type": "string",
                         "description": "New channel name (full name, including any leading emoji)"
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "New channel topic / description (max 1024 chars). Empty string clears it. Text and forum channels only."
+                    },
+                    "slowmode_delay": {
+                        "type": "number",
+                        "description": "Seconds between messages per user, 0 turns slowmode off (max 21600)"
                     },
                     "reason": {
                         "type": "string",
                         "description": "Optional audit-log reason"
                     }
                 },
-                "required": ["channel_id", "name"]
+                "required": ["channel_id"]
             }
         ),
         Tool(
@@ -738,6 +862,14 @@ async def list_tools() -> List[Tool]:
                     "everyone_can_view": {
                         "type": "boolean",
                         "description": "Optional: Controls whether @everyone can view this category. Default is true."
+                    },
+                    "with_general_channel": {
+                        "type": "boolean",
+                        "description": "Optional: also create a '<name>-general' text channel inside (default: false — an empty category is what people usually mean)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional audit-log reason (say who asked)"
                     }
                 },
                 "required": ["name"]
@@ -1889,45 +2021,151 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
 
     # Channel Management Tools
-    elif name == "create_text_channel":
+    elif name == "list_channels":
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
         if not server_id:
             return [TextContent(
                 type="text",
                 text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
             )]
-            
+
         guild = await discord_client.fetch_guild(int(server_id))
+        channels = await guild.fetch_channels()
+        me = await guild.fetch_member(discord_client.user.id)   # guild.me is None on a fetched guild
+
+        cats = sorted([c for c in channels if isinstance(c, discord.CategoryChannel)],
+                      key=lambda c: c.position)
+        rest = [c for c in channels if not isinstance(c, discord.CategoryChannel)]
+        manageable = sum(1 for c in channels if _unmanageable_reason(c, me) is None)
+
+        out = [f"{guild.name} (ID: {guild.id}) — {len(rest)} channels in {len(cats)} categories; "
+               f"I can manage {manageable} of {len(channels)}."]
+
+        def _block(title, items):
+            out.append("")
+            out.append(title)
+            if not items:
+                out.append("  (empty)")
+            for ch in sorted(items, key=lambda c: (c.position, c.id)):
+                out.append(_channel_line(ch, me))
+
+        loose = [c for c in rest if c.category_id is None]
+        if loose:
+            _block("▸ (no category)", loose)
+        for cat in cats:
+            blocked = _unmanageable_reason(cat, me)
+            mark = "✋ " + blocked if blocked else "✅"
+            _block(f"▸ {cat.name} (category, ID: {cat.id}) {mark}",
+                   [c for c in rest if c.category_id == cat.id])
+
+        return [TextContent(type="text", text="\n".join(out))]
+
+    elif name == "create_channel":
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if not server_id:
+            return [TextContent(
+                type="text",
+                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+            )]
+
+        kind = str(arguments.get("type") or "text").strip().lower()
+        if kind not in _CREATABLE:
+            return [TextContent(
+                type="text",
+                text=f"Error: cannot create a '{kind}' channel — I make {', '.join(_CREATABLE)}."
+            )]
+
+        guild = await discord_client.fetch_guild(int(server_id))
+        me = await guild.fetch_member(discord_client.user.id)
+        if not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
+            return [TextContent(
+                type="text",
+                text="Cannot create a channel: I don't have the 'Manage Channels' permission in this server."
+            )]
+
         category = None
-        if "category_id" in arguments:
-            try:
-                # Properly fetch the category instead of using get_channel which only checks cache
-                category = await discord_client.fetch_channel(int(arguments["category_id"]))
-                if not isinstance(category, discord.CategoryChannel):
-                    logger.warning(f"Channel {arguments['category_id']} is not a category channel")
-                    category = None
-            except Exception as e:
-                logger.error(f"Error fetching category: {str(e)}")
-                category = None
-        
-        channel = await guild.create_text_channel(
-            name=arguments["name"],
-            category=category,
-            topic=arguments.get("topic"),
-            reason="Channel created via MCP"
-        )
-        
+        if arguments.get("category_id"):
+            channels = await guild.fetch_channels()
+            category = _resolve_channel(channels, str(arguments["category_id"]))
+            if category is None:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: no category with ID {arguments['category_id']} in this server. Call list_channels for the categories."
+                )]
+            if not isinstance(category, discord.CategoryChannel):
+                return [TextContent(
+                    type="text",
+                    text=f"Error: '{category.name}' (ID: {category.id}) is a {_channel_kind(category)} channel, not a category."
+                )]
+            blocked = _unmanageable_reason(category, me)
+            if blocked:
+                return [TextContent(
+                    type="text",
+                    text=f"Cannot create a channel in '{category.name}': {blocked}"
+                )]
+
+        overwrites = None
+        if arguments.get("private"):
+            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+
+        wanted = arguments["name"]
+        kwargs = {"name": wanted, "category": category, "overwrites": overwrites,
+                  "reason": arguments.get("reason") or "Channel created via MCP"}
+        if arguments.get("topic") and kind in ("text", "forum"):
+            kwargs["topic"] = arguments["topic"]
+        maker = {"text": guild.create_text_channel, "voice": guild.create_voice_channel,
+                 "forum": guild.create_forum}[kind]
+        try:
+            channel = await maker(**{k: v for k, v in kwargs.items() if v is not None})
+        except discord.Forbidden as e:
+            return [TextContent(type="text", text=f"Discord refused to create the channel: {e}")]
+        except discord.HTTPException as e:
+            return [TextContent(type="text", text=f"Discord error while creating the channel: {e}")]
+
+        where = f" in category '{category.name}'" if category else " (no category)"
+        lock = ", hidden from @everyone" if arguments.get("private") else ""
+        # Discord silently normalises text/forum names (lowercase, spaces → dashes). Say so, or the
+        # caller reports back a name that does not exist.
+        renamed = ("" if channel.name == wanted else
+                   f"\nDiscord normalised the name '{wanted}' to '{channel.name}'.")
         return [TextContent(
             type="text",
-            text=f"Created text channel #{channel.name} (ID: {channel.id})"
+            text=(f"Created {kind} channel '{channel.name}' (ID: {channel.id}){where}{lock}."
+                  f"{renamed}")
         )]
 
     elif name == "delete_channel":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        await channel.delete(reason=arguments.get("reason", "Channel deleted via MCP"))
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        except discord.NotFound:
+            return [TextContent(
+                type="text",
+                text=f"Error: no channel with ID {arguments['channel_id']} (already deleted?)."
+            )]
+        guild = channel.guild
+        me = await guild.fetch_member(discord_client.user.id)
+
+        blocked = _unmanageable_reason(channel, me) or _protected_reason(channel, guild)
+        if blocked:
+            return [TextContent(type="text", text=f"Cannot delete '{channel.name}': {blocked}")]
+
+        kind = _channel_kind(channel)
+        # Deleting a category leaves its channels behind, uncategorised — name them, so nobody
+        # believes a whole section just went away (or that it survived).
+        orphans = ([c.name for c in guild.channels if getattr(c, "category_id", None) == channel.id]
+                   if isinstance(channel, discord.CategoryChannel) else [])
+        try:
+            await channel.delete(reason=arguments.get("reason") or "Channel deleted via MCP")
+        except discord.Forbidden as e:
+            return [TextContent(type="text", text=f"Discord refused to delete '{channel.name}': {e}")]
+        except discord.HTTPException as e:
+            return [TextContent(type="text", text=f"Discord error while deleting '{channel.name}': {e}")]
+
+        note = (f" The {len(orphans)} channels it held are still there, now without a category: "
+                + ", ".join(orphans) + ".") if orphans else ""
         return [TextContent(
             type="text",
-            text=f"Deleted channel successfully"
+            text=f"Deleted {kind} channel '{channel.name}' (ID: {channel.id}) and its messages.{note}"
         )]
         
     elif name == "create_thread":
@@ -2057,6 +2295,14 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                     text=f"Error: Role with ID {role_id_str} not found in the server."
                 )]
             
+            me = await guild.fetch_member(discord_client.user.id)
+            blocked = _unmanageable_reason(channel, me)
+            if blocked:
+                return [TextContent(
+                    type="text",
+                    text=f"Cannot change permissions on '{channel.name}': {blocked}"
+                )]
+
             # Set if we allow or deny viewing the channel for the role
             allow_view = arguments.get("allow_view", True)
             
@@ -2100,6 +2346,10 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "move_channel":
         try:
             channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+            me = await channel.guild.fetch_member(discord_client.user.id)
+            blocked = _unmanageable_reason(channel, me)
+            if blocked:
+                return [TextContent(type="text", text=f"Cannot move '{channel.name}': {blocked}")]
 
             # Build edit kwargs
             edit_kwargs = {}
@@ -2147,34 +2397,66 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             )]
 
     elif name == "edit_channel":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        new_name = arguments["name"]
         try:
-            # Discord rate-limits channel renames to 2 / 10 min. On 429 discord.py does NOT
-            # raise — it silently sleeps retry_after (often hundreds of seconds) and retries,
-            # hanging this tool call. Bound the wait: a normal rename is < 1s; not done in
-            # time → we hit the limit, so cancel and tell the caller to try later.
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        except discord.NotFound:
+            return [TextContent(
+                type="text",
+                text=f"Error: no channel with ID {arguments['channel_id']}."
+            )]
+
+        edits, said = {}, []
+        if arguments.get("name"):
+            edits["name"] = arguments["name"]
+            said.append(f"renamed to '{arguments['name']}'")
+        if "topic" in arguments and arguments["topic"] is not None:
+            if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                return [TextContent(
+                    type="text",
+                    text=f"Error: a {_channel_kind(channel)} channel has no topic to set."
+                )]
+            edits["topic"] = arguments["topic"]
+            said.append("topic cleared" if arguments["topic"] == "" else "topic set")
+        if arguments.get("slowmode_delay") is not None:
+            edits["slowmode_delay"] = int(arguments["slowmode_delay"])
+            said.append(f"slowmode {edits['slowmode_delay']}s")
+        if not edits:
+            return [TextContent(
+                type="text",
+                text="Error: nothing to change — pass name, topic or slowmode_delay."
+            )]
+
+        me = await channel.guild.fetch_member(discord_client.user.id)
+        blocked = _unmanageable_reason(channel, me)
+        if blocked:
+            return [TextContent(type="text", text=f"Cannot edit '{channel.name}': {blocked}")]
+
+        try:
+            # Discord rate-limits channel name/topic edits to 2 / 10 min PER CHANNEL. On 429
+            # discord.py does NOT raise — it silently sleeps retry_after (often hundreds of
+            # seconds) and retries, hanging this tool call. Bound the wait: a normal edit is
+            # < 1s; not done in time → we hit the limit, so cancel and say to try later.
             await asyncio.wait_for(
-                channel.edit(name=new_name, reason=arguments.get("reason", "diary-emoji")),
+                channel.edit(reason=arguments.get("reason", "edited via MCP"), **edits),
                 timeout=5)
         except (asyncio.TimeoutError, discord.RateLimited):
             return [TextContent(
                 type="text",
-                text="Rename rate-limited (Discord allows 2 renames / 10 min). Try later."
+                text="Rate-limited (Discord allows 2 name/topic edits per channel / 10 min). Try later."
             )]
-        except discord.Forbidden:
+        except discord.Forbidden as e:
             return [TextContent(
                 type="text",
-                text="Error: Bot doesn't have permission to rename this channel"
+                text=f"Discord refused to edit '{channel.name}': {e}"
             )]
-        except Exception as e:
+        except discord.HTTPException as e:
             return [TextContent(
                 type="text",
-                text=f"Error renaming channel: {str(e)}"
+                text=f"Discord error while editing '{channel.name}': {e}"
             )]
         return [TextContent(
             type="text",
-            text=f"Channel renamed to {new_name}"
+            text=f"Channel {channel.id}: " + ", ".join(said) + "."
         )]
 
     elif name == "create_category":
@@ -2219,27 +2501,35 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 name=arguments["name"],
                 overwrites=overwrites,
                 position=position,
-                reason="Category created via MCP"
+                reason=arguments.get("reason") or "Category created via MCP"
             )
-            
-            # Create a default text channel in the category to make it more visible
-            text_channel = await guild.create_text_channel(
-                name=f"{arguments['name']}-general",
-                category=category,
-                reason="Default channel for new category"
-            )
-            
-            # Generate appropriate success message
+
+            # A '<name>-general' channel used to appear here unasked. Now it is opt-in: "make a
+            # category" means a category, and a channel nobody ordered is noise someone must delete.
+            note = ""
+            if arguments.get("with_general_channel"):
+                text_channel = await guild.create_text_channel(
+                    name=f"{arguments['name']}-general",
+                    category=category,
+                    reason="Default channel for new category"
+                )
+                note = f" with channel #{text_channel.name} (ID: {text_channel.id}) inside"
+
             if restricted_role_id and not everyone_can_view:
-                msg = f"Created restricted category {category.name} (ID: {category.id}) with default channel #{text_channel.name}. Only specified roles can view it."
+                who = ". Only the given role can view it."
             elif not everyone_can_view:
-                msg = f"Created hidden category {category.name} (ID: {category.id}) with default channel #{text_channel.name}. @everyone cannot view it."
+                who = ". @everyone cannot view it."
             else:
-                msg = f"Created category {category.name} (ID: {category.id}) with default channel #{text_channel.name}"
-                
+                who = "."
+
             return [TextContent(
                 type="text",
-                text=msg
+                text=f"Created category '{category.name}' (ID: {category.id}){note}{who}"
+            )]
+        except discord.Forbidden as e:
+            return [TextContent(
+                type="text",
+                text=f"Discord refused to create the category (do I have 'Manage Channels'?): {e}"
             )]
         except Exception as e:
             return [TextContent(

@@ -9,8 +9,10 @@ This is a **fork of [netixc/mcp-discord](https://github.com/netixc/mcp-discord)*
 - `send_file` — upload a local file to a channel
 - `send_voice_message` — send a NATIVE voice message (waveform bubble; any audio in, ffmpeg required)
 - `download_attachment` — save a Discord attachment to a local path
+- `list_channels` — the channel tree (categories → channels) with kind, ID, 🔒 private and ✅/✋ "can I manage it"
+- `create_channel` — create a text, voice or forum channel (optionally private, in a category)
 - `move_channel` — reposition a channel / move it between categories
-- `edit_channel` — rename a channel (e.g. change a diary's leading emoji)
+- `edit_channel` — change a channel's name, topic or slowmode
 - `edit_message` — rewrite one of the bot's own earlier messages (e.g. keep a channel-side digest of a thread current)
 - `list_emojis` / `create_emoji` / `edit_emoji` / `delete_emoji` — manage the server's custom emojis (upload from a file or URL; oversized images are auto-resized)
 - `list_stickers` / `create_sticker` / `edit_sticker` / `delete_sticker` / `send_sticker` — manage and post the server's custom stickers (auto-fitted to Discord's exact 320×320 / 512 KB)
@@ -143,12 +145,18 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 - `get_user_info` — name, discriminator, bot flag, creation date, avatar/banner URLs for a `user_id`, plus their **server membership** (nickname, join date, roles held) when they are a member — the cheap way to see someone's current roles before changing them.
 
 ### Channels
-- `create_text_channel`, `delete_channel`
-- `create_category` (with optional restricted-role visibility)
+Every write below states the actual cause when it cannot proceed (missing *Manage Channels* server-wide, a
+per-channel overwrite that denies it, a Community rules/updates channel Discord will not let go) instead of
+returning the bare 403 the caller has to guess at — same idiom as the role tools.
+
+- `list_channels` *(fork addition)* — the whole tree: categories in order, the channels inside each, and per channel its **kind** (text / voice / forum / announcement / stage), ID, `🔒 private` when @everyone cannot see it, and **✅ I can manage / ✋ I cannot** with the reason. Unlike `get_server_info` it does not silently omit forum channels. Look here before changing anything.
+- `create_channel` *(fork addition, replaces `create_text_channel`)* — `type`: `text` (default), `voice` or `forum`; optional `category_id`, `topic`, `private` (hides it from @everyone) and audit-log `reason`. Discord lowercases text/forum names and turns spaces into dashes — the tool reports the name it actually got.
+- `delete_channel` — permanent, messages included. Names what it deleted; deleting a **category** does not delete the channels inside, and the reply lists the ones left behind uncategorised.
+- `create_category` (with optional restricted-role visibility). The `<name>-general` channel it used to create unasked is now opt-in via `with_general_channel`.
 - `create_thread` (from a message or standalone)
 - `set_channel_permissions` (per-role view/send/read-history, optional @everyone)
 - `move_channel` *(fork addition)* — reposition / move between categories, optionally syncing category permissions.
-- `edit_channel` *(fork addition)* — rename a channel (full new name); bounded 5s wait so a rename rate-limit (2 / 10 min) returns cleanly instead of hanging.
+- `edit_channel` *(fork addition)* — change `name`, `topic` and/or `slowmode_delay`; pass only what should change. Bounded 5s wait so Discord's 2-edits-per-channel-per-10-min limit returns cleanly instead of hanging.
 
 ### Roles
 - `list_roles` — roles highest first, each marked **✅ assignable / ✋ not** (with the reason: integration-managed, at/above the bot's top role, missing *Manage Roles*) and flagged **⚠** when it grants staff permissions. Check this before assigning. To see *who* holds a role, use `list_members` with its `role` filter.
