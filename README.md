@@ -140,7 +140,7 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 ### Server & user info
 - `get_server_info` — guild metadata + categories and text/voice channels with IDs.
 - `list_members` — members with nicks, join dates, and role IDs (`limit` ≤ 1000).
-- `get_user_info` — name, discriminator, bot flag, creation date for a `user_id`.
+- `get_user_info` — name, discriminator, bot flag, creation date, avatar/banner URLs for a `user_id`, plus their **server membership** (nickname, join date, roles held) when they are a member — the cheap way to see someone's current roles before changing them.
 
 ### Channels
 - `create_text_channel`, `delete_channel`
@@ -151,8 +151,9 @@ All IDs (channel, message, user, role, server) are passed as **strings**.
 - `edit_channel` *(fork addition)* — rename a channel (full new name); bounded 5s wait so a rename rate-limit (2 / 10 min) returns cleanly instead of hanging.
 
 ### Roles
-- `create_role`, `delete_role`, `list_roles`
-- `add_role`, `remove_role` (assign/unassign on a member)
+- `list_roles` — roles highest first, each marked **✅ assignable / ✋ not** (with the reason: integration-managed, at/above the bot's top role, missing *Manage Roles*) and flagged **⚠** when it grants staff permissions. Check this before assigning. To see *who* holds a role, use `list_members` with its `role` filter.
+- `add_role`, `remove_role` — give/take a role on a member. `role` accepts the **name** (case-insensitive, `@` optional) or the ID, so no ID lookup is needed. Both refuse with the real cause instead of a bare 403, report a no-op harmlessly when the member already has (or already lacks) the role, take an audit-log `reason`, and warn when the role just granted staff powers.
+- `create_role`, `delete_role`
 
 ### Emojis *(fork addition)*
 - `list_emojis` — the server's custom emojis; each line gives the exact string to type in a message or pass to `add_reaction` (`<:name:id>`, `<a:name:id>` when animated) plus any role restriction.

@@ -294,6 +294,60 @@ def _sticker_line(sticker) -> str:
     return f"{sticker.name} (ID: {sticker.id}, {sticker.format.name}{tag}){desc}"
 
 
+# ---- Roles -------------------------------------------------------------------------------------
+# Handing someone a role is the one Discord write that can hand out POWER, and it fails in ways the
+# caller cannot guess from a bare "403 Forbidden": the role may be integration-managed (Discord
+# refuses manual assignment outright, even for the server owner), or it may sit at/above the bot's
+# own top role in the hierarchy. Both are checked BEFORE the API call and named in the error, and
+# list_roles shows them up front so the caller sees what is assignable without trying.
+
+# Permissions that make a role a privilege grant rather than a label. Surfaced so that handing out
+# a cosmetic role is never confused with handing out staff powers.
+_PRIVILEGED_PERMS = (
+    "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks",
+    "manage_expressions", "ban_members", "kick_members", "moderate_members", "manage_messages",
+    "manage_nicknames", "manage_events", "manage_threads", "mention_everyone",
+)
+
+
+def _privileged_perms(role) -> List[str]:
+    """Privilege-granting permissions this role carries; empty for a purely cosmetic role."""
+    p = role.permissions
+    if p.administrator:
+        return ["administrator"]          # implies every other permission; listing them adds noise
+    return [n for n in _PRIVILEGED_PERMS if getattr(p, n, False)]
+
+
+def _resolve_role(guild, role_arg: str):
+    """'@Птички' | 'птичк' | '123…' → Role or None (same id-or-name idiom as list_members' filter)."""
+    role_arg = (role_arg or "").strip().lstrip("@")
+    if not role_arg:
+        return None
+    if role_arg.isdigit():
+        return guild.get_role(int(role_arg))
+    low = role_arg.lower()
+    exact = next((r for r in guild.roles if r.name.lower() == low), None)
+    return exact or next((r for r in guild.roles if low in r.name.lower()), None)
+
+
+def _unassignable_reason(role, me) -> Optional[str]:
+    """Why we cannot give/take this role, or None when we can. Checked before the call so the caller
+    gets the actual cause instead of a 403 they have to guess at."""
+    if role.is_default():
+        return "@everyone is not an assignable role — every member has it by definition."
+    if role.managed:
+        return (f"'{role.name}' is managed by an integration (a bot's own role, a booster or "
+                "subscription role) — Discord does not allow assigning it manually to anyone.")
+    if not (me.guild_permissions.manage_roles or me.guild_permissions.administrator):
+        return "I don't have the 'Manage Roles' permission in this server."
+    if role >= me.top_role:
+        return (f"'{role.name}' (position {role.position}) is not below my own top role "
+                f"'{me.top_role.name}' (position {me.top_role.position}) — Discord only lets a bot "
+                "manage roles strictly beneath its highest one. Move my role above it in "
+                "Server Settings → Roles.")
+    return None
+
+
 # Initialize MCP server
 app = Server("discord-server")
 
@@ -409,7 +463,13 @@ async def list_tools() -> List[Tool]:
         # Role Management Tools
         Tool(
             name="add_role",
-            description="Add a role to a user",
+            description=(
+                "Give a member a role. `role` takes the role NAME or its ID — no need to look the ID "
+                "up first. Refuses with the real reason (integration-managed role, role above my own "
+                "top role, missing Manage Roles) instead of a bare 403, and says so harmlessly when "
+                "the member already has the role. Warns when the role grants staff powers. "
+                "Use list_roles to see what is assignable."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -419,19 +479,31 @@ async def list_tools() -> List[Tool]:
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "User to add role to"
+                        "description": "ID of the member to give the role to"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role name (e.g. 'Птички', case-insensitive, '@' optional) or role ID"
                     },
                     "role_id": {
                         "type": "string",
-                        "description": "Role ID to add"
+                        "description": "Deprecated alias for `role` (ID only). Prefer `role`."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason shown in the server's audit log (optional)"
                     }
                 },
-                "required": ["user_id", "role_id"]
+                "required": ["user_id"]
             }
         ),
         Tool(
             name="remove_role",
-            description="Remove a role from a user",
+            description=(
+                "Take a role away from a member. `role` takes the role NAME or its ID. Same explicit "
+                "refusals as add_role (managed role, hierarchy, missing permission), and says so "
+                "harmlessly when the member doesn't have the role in the first place."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -441,14 +513,22 @@ async def list_tools() -> List[Tool]:
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "User to remove role from"
+                        "description": "ID of the member to take the role from"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role name (e.g. 'Птички', case-insensitive, '@' optional) or role ID"
                     },
                     "role_id": {
                         "type": "string",
-                        "description": "Role ID to remove"
+                        "description": "Deprecated alias for `role` (ID only). Prefer `role`."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason shown in the server's audit log (optional)"
                     }
                 },
-                "required": ["user_id", "role_id"]
+                "required": ["user_id"]
             }
         ),
 
@@ -908,13 +988,22 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_user_info",
-            description="Get information about a Discord user, including their avatar/banner CDN URLs (download the returned Avatar URL with download_attachment).",
+            description=(
+                "Get information about a Discord user: avatar/banner CDN URLs (download the returned "
+                "Avatar URL with download_attachment) plus, when they are a member of the server, "
+                "their nickname, join date and the roles they currently hold — check this before "
+                "changing anyone's roles with add_role/remove_role."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "user_id": {
                         "type": "string",
                         "description": "Discord user ID"
+                    },
+                    "server_id": {
+                        "type": "string",
+                        "description": "Server to read their membership (nickname/roles) from. Defaults to the default server."
                     }
                 },
                 "required": ["user_id"]
@@ -1006,7 +1095,12 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="list_roles",
-            description="List all roles in the server",
+            description=(
+                "List the server's roles, highest first. Each line says whether I can actually "
+                "assign it (hierarchy / integration-managed) and which staff permissions it grants, "
+                "so you can see what add_role will accept before calling it. To see WHO holds a "
+                "role, use list_members with its `role` filter."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1505,6 +1599,27 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         custom_avatar_url = _sized(user.avatar) if user.avatar else None
         banner_url = _sized(user.banner) if user.banner else None
 
+        # Membership half: fetch_user above is the GLOBAL account and carries no nickname or roles.
+        # Best-effort — a user who isn't in this server (or no server_id at all) simply has none.
+        member_lines = []
+        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
+        if server_id:
+            try:
+                guild = await discord_client.fetch_guild(int(server_id))
+                member = await guild.fetch_member(user.id)
+                roles = [r for r in member.roles if not r.is_default()]   # drop @everyone
+                roles.sort(key=lambda r: r.position, reverse=True)
+                member_lines = [
+                    f"Server: {guild.name}",
+                    f"Nickname: {member.nick or '-'} (shown as: {member.display_name})",
+                    f"Joined: {member.joined_at.isoformat() if member.joined_at else '-'}",
+                    "Roles: " + (", ".join(f"{r.name} (ID: {r.id})" for r in roles) or "— (none)"),
+                ]
+            except discord.NotFound:
+                member_lines = [f"Not a member of server {server_id}."]
+            except Exception as e:
+                member_lines = [f"(could not read server membership: {e})"]
+
         return [TextContent(
             type="text",
             text="User information:\n" +
@@ -1515,7 +1630,8 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                  f"Created: {user.created_at.isoformat()}\n" +
                  f"Avatar URL: {display_avatar_url}\n" +
                  f"Custom avatar: {custom_avatar_url or '(none — using Discord default)'}\n" +
-                 f"Banner URL: {banner_url or '(none)'}"
+                 f"Banner URL: {banner_url or '(none)'}" +
+                 ("\n" + "\n".join(member_lines) if member_lines else "")
         )]
 
     elif name == "moderate_message":
@@ -1696,40 +1812,80 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         return [TextContent(type="text", text="\n".join(lines))]
 
     # Role Management Tools
-    elif name == "add_role":
+    # add_role and remove_role are one handler: the guard rails (member exists, role resolves,
+    # no-op, managed/hierarchy/permission) are identical and only the verb differs.
+    elif name in ("add_role", "remove_role"):
+        adding = name == "add_role"
+        verb, prep = ("add", "to") if adding else ("remove", "from")
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
         if not server_id:
             return [TextContent(
                 type="text",
                 text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
             )]
-            
-        guild = await discord_client.fetch_guild(int(server_id))
-        member = await guild.fetch_member(int(arguments["user_id"]))
-        role = guild.get_role(int(arguments["role_id"]))
-        
-        await member.add_roles(role, reason="Role added via MCP")
-        return [TextContent(
-            type="text",
-            text=f"Added role {role.name} to user {member.name}"
-        )]
 
-    elif name == "remove_role":
-        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
-        if not server_id:
+        guild = await discord_client.fetch_guild(int(server_id))
+
+        try:
+            member = await guild.fetch_member(int(arguments["user_id"]))
+        except discord.NotFound:
             return [TextContent(
                 type="text",
-                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
+                text=f"Error: nobody with ID {arguments['user_id']} is a member of this server (they may have left)."
             )]
-            
-        guild = await discord_client.fetch_guild(int(server_id))
-        member = await guild.fetch_member(int(arguments["user_id"]))
-        role = guild.get_role(int(arguments["role_id"]))
-        
-        await member.remove_roles(role, reason="Role removed via MCP")
+
+        role_arg = str(arguments.get("role") or arguments.get("role_id") or "").strip()
+        if not role_arg:
+            return [TextContent(type="text", text="Error: which role? Pass `role` (name or ID).")]
+        role = _resolve_role(guild, role_arg)
+        if role is None:
+            return [TextContent(
+                type="text",
+                text=f"Error: no role matching '{role_arg}' in this server. Call list_roles for the exact names and IDs."
+            )]
+
+        # No-op first: report it plainly instead of spending a write and an audit-log entry.
+        has_role = any(r.id == role.id for r in member.roles)
+        if adding and has_role:
+            return [TextContent(
+                type="text",
+                text=f"{member.display_name} (ID: {member.id}) already has '{role.name}' — nothing to do."
+            )]
+        if not adding and not has_role:
+            return [TextContent(
+                type="text",
+                text=f"{member.display_name} (ID: {member.id}) doesn't have '{role.name}' — nothing to do."
+            )]
+
+        me = await guild.fetch_member(discord_client.user.id)   # guild.me is None on a fetched guild
+        blocked = _unassignable_reason(role, me)
+        if blocked:
+            return [TextContent(type="text", text=f"Cannot {verb} '{role.name}': {blocked}")]
+
+        reason = arguments.get("reason") or f"Role {'added' if adding else 'removed'} via MCP"
+        try:
+            if adding:
+                await member.add_roles(role, reason=reason)
+            else:
+                await member.remove_roles(role, reason=reason)
+        except discord.Forbidden as e:
+            return [TextContent(
+                type="text",
+                text=f"Discord refused to {verb} '{role.name}' {prep} {member.display_name}: {e}"
+            )]
+        except discord.HTTPException as e:
+            return [TextContent(
+                type="text",
+                text=f"Discord error while trying to {verb} '{role.name}' {prep} {member.display_name}: {e}"
+            )]
+
+        # Say out loud when the role just granted staff powers — a role name alone doesn't show it.
+        perms = _privileged_perms(role)
+        note = f"\n⚠ This role grants: {', '.join(perms)}." if (adding and perms) else ""
         return [TextContent(
             type="text",
-            text=f"Removed role {role.name} from user {member.name}"
+            text=(f"{'Added' if adding else 'Removed'} role '{role.name}' (ID: {role.id}) {prep} "
+                  f"{member.display_name} (@{member.name}, ID: {member.id}).{note}")
         )]
 
     # Channel Management Tools
@@ -2217,43 +2373,51 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
                 type="text",
                 text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
             )]
-            
+
         guild = await discord_client.fetch_guild(int(server_id))
-        
+
         try:
-            # Fetch all roles from the guild
-            roles = await guild.fetch_roles()
-            
-            # Format role information
-            role_info = []
+            roles = sorted(await guild.fetch_roles(), key=lambda r: r.position, reverse=True)
+            me = await guild.fetch_member(discord_client.user.id)
+
+            lines = [
+                f"Roles in {guild.name} ({len(roles)}), highest first. "
+                f"My own top role: '{me.top_role.name}' (position {me.top_role.position}).",
+                "  ✅ I can add/remove it   ✋ I cannot (reason in brackets)   ⚠ grants staff powers",
+            ]
             for role in roles:
-                role_info.append({
-                    "id": str(role.id),
-                    "name": role.name,
-                    "color": str(role.color),
-                    "position": role.position,
-                    "hoisted": role.hoist,
-                    "mentionable": role.mentionable
-                })
-            
-            # Sort roles by position (higher positions are higher in the hierarchy)
-            role_info.sort(key=lambda r: r["position"], reverse=True)
-            
-            # Format the output
-            result = "Server Roles:\n"
-            for role in role_info:
-                result += f"- {role['name']} (ID: {role['id']}, Position: {role['position']})\n"
-            
-            return [TextContent(
-                type="text",
-                text=result
-            )]
+                blocked = _unassignable_reason(role, me)
+                mark = "✋" if blocked else "✅"
+                bits = [f"ID: {role.id}", f"position {role.position}"]
+                if role.managed:
+                    bits.append("integration-managed")
+                if role.hoist:
+                    bits.append("shown separately")
+                if role.mentionable:
+                    bits.append("mentionable")
+                line = f"{mark} {role.name} ({', '.join(bits)})"
+                if blocked:
+                    # The full sentence lives in the error path; here just the short cause.
+                    if role.is_default():
+                        line += " [everyone has it]"
+                    elif role.managed:
+                        line += " [managed — never assignable]"
+                    elif role >= me.top_role:
+                        line += " [at/above my top role]"
+                    else:
+                        line += " [I lack Manage Roles]"
+                perms = _privileged_perms(role)
+                if perms:
+                    line += f"  ⚠ grants: {', '.join(perms)}"
+                lines.append(line)
+
+            return [TextContent(type="text", text="\n".join(lines))]
         except Exception as e:
             return [TextContent(
                 type="text",
                 text=f"Error listing roles: {str(e)}"
             )]
-    
+
     # Custom Emoji Tools
     elif name == "list_emojis":
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
