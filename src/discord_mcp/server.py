@@ -348,6 +348,231 @@ def _unassignable_reason(role, me) -> Optional[str]:
     return None
 
 
+# --- Editing the role ITSELF (name, colour, icon, permissions, position) -------------------------
+# A different kind of write from handing a role to someone: it changes what the role IS for everyone
+# who already holds it, and deleting one is irreversible (Discord strips it from every member, no
+# undo). Two failure modes appear here that add_role never meets, and both come back as a bare 403/
+# 400 that names nothing, so both are checked BEFORE the call:
+#   * escalation — Discord will not let a bot GRANT a permission it does not itself hold;
+#   * role icons — they exist only on servers carrying ROLE_ICONS in guild.features (boost level 2).
+_ROLE_ICON_MAX_BYTES = 256 * 1024          # same cap as a custom emoji
+_ROLE_ICON_SIZES = (128, 96, 64)           # a role icon renders at ~20-24 px; 128 is already generous
+
+
+def _parse_colour(value) -> discord.Colour:
+    """'#E67E22' | 'e67e22' | 'rgb(230,126,34)' | 'blurple' | 'none' -> Colour ('none' = no colour).
+
+    Discord has no "unset" colour: the default is the integer 0, which the client renders as the
+    plain grey of an uncoloured role — so clearing a colour and never having one are the same thing.
+    """
+    s = str(value).strip()
+    if s.lower() in ("", "none", "default", "clear", "нет", "убрать", "сбросить"):
+        return discord.Colour.default()
+    literal = s if (s.startswith("#") or s.lower().startswith(("0x", "rgb"))) else f"#{s}"
+    try:
+        return discord.Colour.from_str(literal)
+    except (ValueError, IndexError):
+        pass
+    named = getattr(discord.Colour, s.lower().replace(" ", "_").replace("-", "_"), None)
+    if callable(named):                     # discord.Colour.red(), .blurple(), .gold(), …
+        try:
+            got = named()
+            if isinstance(got, discord.Colour):
+                return got
+        except TypeError:                   # a classmethod that wants arguments (from_str, from_rgb)
+            pass
+    raise ValueError(
+        f"unrecognised colour '{value}' — pass a hex ('#E67E22' or 'E67E22'), 'rgb(230,126,34)', a "
+        "Discord colour name (blurple, red, gold, teal, fuchsia, orange, …) or 'none' to clear it")
+
+
+def _colour_str(role) -> str:
+    return "none" if role.colour.value == 0 else str(role.colour)
+
+
+def _parse_perm_names(names, what="permissions") -> List[str]:
+    """['manage messages', 'Kick Members'] -> ['manage_messages', 'kick_members']; unknown -> ValueError.
+
+    Names are Discord's own permission flags (discord.py's VALID_FLAGS), so an unknown one is a typo,
+    not a silently-ignored no-op: a permission that quietly fails to apply is the worst outcome here.
+    """
+    valid = discord.Permissions.VALID_FLAGS
+    out = []
+    for raw in names:
+        n = str(raw).strip().lower().lstrip("@").replace(" ", "_").replace("-", "_")
+        if n not in valid:
+            close = sorted(v for v in valid if n and (n in v or v in n))
+            hint = f" Did you mean: {', '.join(close[:5])}?" if close else ""
+            raise ValueError(f"unknown permission '{raw}' in {what}.{hint}")
+        out.append(n)
+    return out
+
+
+def _permissions_from(spec) -> discord.Permissions:
+    """Permission names (list or comma/space string), 'none', 'all', or a raw bitfield -> Permissions."""
+    import re
+    if isinstance(spec, str):
+        s = spec.strip().lower()
+        if s in ("", "none", "0", "нет"):
+            return discord.Permissions.none()
+        if s == "all":
+            return discord.Permissions.all()
+        if s.isdigit():
+            return discord.Permissions(permissions=int(s))       # legacy bitfield form
+        spec = [p for p in re.split(r"[,\s]+", s) if p]
+    if isinstance(spec, int):
+        return discord.Permissions(permissions=spec)
+    return discord.Permissions(**{n: True for n in _parse_perm_names(spec)})
+
+
+def _escalation_reason(new_perms: discord.Permissions, me) -> Optional[str]:
+    """Permissions in `new_perms` that I don't hold myself — Discord refuses those with a bare 403."""
+    if me.guild_permissions.administrator:
+        return None
+    missing = [n for n, on in new_perms if on and not getattr(me.guild_permissions, n, False)]
+    if not missing:
+        return None
+    return ("Discord does not let a bot grant permissions it doesn't hold itself, and I'm missing: "
+            + ", ".join(sorted(missing))
+            + ". Give my own role those permissions first (Server Settings → Roles), or drop them "
+              "from this request.")
+
+
+def _uneditable_reason(role, me) -> Optional[str]:
+    """Why we cannot edit/delete the role ITSELF, or None. Stricter than _unassignable_reason: the
+    default role and integration-managed roles are off limits as objects, not just as grants."""
+    if not (me.guild_permissions.manage_roles or me.guild_permissions.administrator):
+        return "I don't have the 'Manage Roles' permission in this server."
+    if role.is_default():
+        return ("@everyone is the server-wide default role — it has no name, colour, icon or "
+                "position of its own and cannot be deleted. Server-wide defaults live in "
+                "Server Settings → Roles.")
+    if role.managed:
+        return (f"'{role.name}' is managed by an integration (a bot's own role, a booster or "
+                "subscription role) — Discord owns it, so it cannot be renamed, recoloured or "
+                "deleted here.")
+    if role >= me.top_role:
+        return (f"'{role.name}' (position {role.position}) is at or above my own top role "
+                f"'{me.top_role.name}' (position {me.top_role.position}) — Discord only lets a bot "
+                "change roles strictly beneath its highest one. Move my role above it in "
+                "Server Settings → Roles.")
+    return None
+
+
+def _role_icons_available(guild) -> bool:
+    """Role icons need the ROLE_ICONS guild feature (boost level 2); without it the API 400s."""
+    return "ROLE_ICONS" in (getattr(guild, "features", None) or [])
+
+
+def _fit_role_icon(raw: bytes) -> bytes:
+    """Any image -> PNG under the 256 KB role-icon cap. Unlike emojis, role icons take PNG/JPEG only,
+    so an animated source is flattened to its first frame instead of being kept as a GIF."""
+    import io
+    try:
+        from PIL import Image
+    except ImportError:
+        if raw[:3] == b"GIF":
+            raise RuntimeError("role icons must be PNG or JPEG (Discord rejects GIF) and Pillow is "
+                               "not installed to convert it — convert the file first")
+        if len(raw) > _ROLE_ICON_MAX_BYTES:
+            raise RuntimeError(f"image is {len(raw) // 1024} KB, over Discord's 256 KB role-icon "
+                               "limit, and Pillow is not installed to shrink it")
+        return raw
+
+    src = Image.open(io.BytesIO(raw))
+    if (src.format in ("PNG", "JPEG") and not getattr(src, "is_animated", False)
+            and len(raw) <= _ROLE_ICON_MAX_BYTES):
+        return raw                                   # already conformant — do not re-encode
+    out = raw
+    for size in _ROLE_ICON_SIZES:
+        buf = io.BytesIO()
+        img = src.convert("RGBA")                    # frame 0 of an animated source
+        img.thumbnail((size, size), Image.LANCZOS)
+        img.save(buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+        if len(out) <= _ROLE_ICON_MAX_BYTES:
+            return out
+    raise RuntimeError(f"could not shrink the icon under 256 KB (smallest attempt: {len(out) // 1024} KB)")
+
+
+async def _role_icon_from(guild, emoji=None, file_path=None, url=None):
+    """-> (display_icon, spoken description). A unicode emoji stays a string (Discord stores it as
+    one); a CUSTOM server emoji is not accepted by the role endpoint, so its image is downloaded and
+    uploaded as the icon instead — otherwise ':ежик:' would silently mean nothing here."""
+    if file_path or url:
+        return _fit_role_icon(await _read_image_source(file_path, url)), "custom image"
+    ref = str(emoji).strip()
+    custom = _find_emoji(await guild.fetch_emojis(), ref) if (":" in ref or ref.isdigit()) else None
+    if custom:
+        return _fit_role_icon(await custom.read()), f"image of :{custom.name}:"
+    return ref, ref
+
+
+async def _move_role(guild, role, position: int, reason):
+    """Put the role at `position` and let DISCORD do the reshuffle.
+
+    Role.edit(position=…) cannot be used here: discord.py computes the new ordering client-side and
+    assumes every role has a DISTINCT position, while Discord happily gives two roles the same number
+    (ordering them by id). On a tie the computed payload comes out one slot short and the role
+    silently does not move — the call still "succeeds". The bulk endpoint has no such assumption.
+    """
+    await guild.edit_role_positions(positions={role: position}, reason=reason)
+
+
+async def _refetch_role(guild, role_id):
+    """Re-read a role straight from the API — the authority on where it ACTUALLY landed after a move."""
+    try:
+        return next((r for r in await guild.fetch_roles() if r.id == role_id), None)
+    except discord.HTTPException:
+        return None
+
+
+async def _role_holder_count(guild, role, cap: int = 1000):
+    """(holders, hit_cap) — how many members hold the role. Said out loud before an IRREVERSIBLE
+    delete, because Discord strips the role from all of them silently. Best effort: needs the
+    members intent and a member fetch, so any failure returns (None, False) instead of blocking."""
+    try:
+        n = 0
+        seen = 0
+        async for m in guild.fetch_members(limit=cap):
+            seen += 1
+            if any(r.id == role.id for r in m.roles):
+                n += 1
+        return n, seen >= cap
+    except Exception:
+        return None, False
+
+
+def _role_line(role, me) -> str:
+    """One list_roles line: what the role looks like, what it grants, whether I can hand it out."""
+    blocked = _unassignable_reason(role, me)
+    bits = [f"ID: {role.id}", f"position {role.position}", f"colour {_colour_str(role)}"]
+    icon = role.display_icon
+    if icon is not None:
+        bits.append(f"icon {icon}" if isinstance(icon, str) else "icon: image")
+    if role.managed:
+        bits.append("integration-managed")
+    if role.hoist:
+        bits.append("shown separately")
+    if role.mentionable:
+        bits.append("mentionable")
+    line = f"{'✋' if blocked else '✅'} {role.name} ({', '.join(bits)})"
+    if blocked:
+        # The full sentence lives in the error path; here just the short cause.
+        if role.is_default():
+            line += " [everyone has it]"
+        elif role.managed:
+            line += " [managed — never assignable]"
+        elif role >= me.top_role:
+            line += " [at/above my top role]"
+        else:
+            line += " [I lack Manage Roles]"
+    perms = _privileged_perms(role)
+    if perms:
+        line += f"  ⚠ grants: {', '.join(perms)}"
+    return line
+
+
 # ---- Channels ----------------------------------------------------------------------------------
 # Creating and renaming a channel is cheap and reversible; DELETING one is not — its messages go
 # with it and Discord offers no undo. So every write here names what it is about to touch (kind,
@@ -1171,7 +1396,13 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="create_role",
-            description="Create a new role in the server",
+            description=(
+                "Create a role. Everything the Discord role editor offers is here: name, colour, "
+                "icon, hoist, mentionable, permissions (by NAME — e.g. ['kick_members']) and a "
+                "starting position. Refuses with the real reason (missing Manage Roles, a "
+                "permission I don't hold myself and so cannot grant, no ROLE_ICONS on this server) "
+                "instead of a bare 403/400."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1185,27 +1416,56 @@ async def list_tools() -> List[Tool]:
                     },
                     "color": {
                         "type": "string",
-                        "description": "Color of the role in hex format (e.g., '#FF0000' for red)"
+                        "description": "Colour: hex ('#E67E22' or 'E67E22'), 'rgb(230,126,34)', a Discord colour name ('blurple', 'red', 'gold', 'teal', 'fuchsia'…), or 'none' for no colour."
                     },
                     "hoist": {
                         "type": "boolean",
-                        "description": "Whether the role should be displayed separately in the member list"
+                        "description": "Show holders of this role in their own section of the member list (default: false)"
                     },
                     "mentionable": {
                         "type": "boolean",
-                        "description": "Whether the role can be mentioned by anyone"
+                        "description": "Let anyone @-mention the role (default: false)"
                     },
                     "permissions": {
+                        "type": ["array", "string"],
+                        "items": {"type": "string"},
+                        "description": "Permissions the role grants, as Discord flag NAMES: ['manage_messages', 'kick_members']. Also accepts 'none' (default — a purely cosmetic role), 'all', or a raw bitfield string. I can only grant permissions I hold myself."
+                    },
+                    "icon_emoji": {
                         "type": "string",
-                        "description": "Permissions as an integer (optional)"
+                        "description": "Role icon as an emoji: a unicode emoji ('🌱') or a custom server emoji (':name:' / '<:name:id>' — its image is uploaded, since Discord stores role icons as images). Needs ROLE_ICONS (server boost level 2)."
+                    },
+                    "icon_file_path": {
+                        "type": "string",
+                        "description": "Role icon from a local image file (PNG/JPEG; oversized images are downscaled). Needs ROLE_ICONS."
+                    },
+                    "icon_url": {
+                        "type": "string",
+                        "description": "Role icon downloaded from this image URL. Needs ROLE_ICONS."
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": "Optional starting position (1 = just above @everyone, higher = further up). Must stay below my own top role. Prefer `above`/`below` in edit_role for readability."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason — say who asked and where."
                     }
                 },
                 "required": ["name"]
             }
         ),
         Tool(
-            name="delete_role",
-            description="Delete a role from the server",
+            name="edit_role",
+            description=(
+                "Change an existing role: rename it, recolour it, set or clear its icon, hoist it, "
+                "make it mentionable, rewrite its permissions (replace with `permissions`, or nudge "
+                "with `grant_permissions` / `revoke_permissions`), and move it up or down "
+                "(`position`, or `above`/`below` another role). `role` takes the role NAME or its "
+                "ID. Refuses with the real reason — integration-managed role, role at/above my own "
+                "top role, missing Manage Roles, a permission I cannot grant, no ROLE_ICONS on this "
+                "server. Editing a role changes it for EVERYONE who already holds it."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1213,24 +1473,116 @@ async def list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "Discord server ID. If not provided, the default server ID will be used."
                     },
-                    "role_id": {
+                    "role": {
                         "type": "string",
-                        "description": "ID of the role to delete"
+                        "description": "Role to edit: name (case-insensitive, '@' optional) or ID"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name"
+                    },
+                    "color": {
+                        "type": "string",
+                        "description": "New colour: hex ('#E67E22'), 'rgb(...)', a Discord colour name, or 'none' to clear it."
+                    },
+                    "hoist": {
+                        "type": "boolean",
+                        "description": "Show holders in their own section of the member list"
+                    },
+                    "mentionable": {
+                        "type": "boolean",
+                        "description": "Let anyone @-mention the role"
+                    },
+                    "permissions": {
+                        "type": ["array", "string"],
+                        "items": {"type": "string"},
+                        "description": "REPLACE the role's whole permission set with these flag names (or 'none' / 'all' / a bitfield). Everything not listed is turned OFF — use grant_permissions/revoke_permissions to change only some."
+                    },
+                    "grant_permissions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Turn these permission flags ON, leaving the rest of the role's permissions as they are."
+                    },
+                    "revoke_permissions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Turn these permission flags OFF, leaving the rest as they are."
+                    },
+                    "icon_emoji": {
+                        "type": "string",
+                        "description": "New icon: unicode emoji ('🌱') or custom server emoji (':name:' / '<:name:id>', uploaded as an image). Needs ROLE_ICONS (boost level 2)."
+                    },
+                    "icon_file_path": {
+                        "type": "string",
+                        "description": "New icon from a local image file (PNG/JPEG; downscaled if oversized). Needs ROLE_ICONS."
+                    },
+                    "icon_url": {
+                        "type": "string",
+                        "description": "New icon downloaded from this image URL. Needs ROLE_ICONS."
+                    },
+                    "clear_icon": {
+                        "type": "boolean",
+                        "description": "Remove the role's icon entirely."
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": "Absolute position (1 = just above @everyone, higher = further up; list_roles prints each role's position). Must stay below my own top role."
+                    },
+                    "above": {
+                        "type": "string",
+                        "description": "Move this role directly ABOVE the named role (name or ID) — usually what 'сделай её выше X' means."
+                    },
+                    "below": {
+                        "type": "string",
+                        "description": "Move this role directly BELOW the named role (name or ID)."
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Reason for deleting the role"
+                        "description": "Audit-log reason — say who asked and where."
                     }
                 },
-                "required": ["role_id"]
+                "required": ["role"]
+            }
+        ),
+        Tool(
+            name="delete_role",
+            description=(
+                "Delete a role. IRREVERSIBLE — Discord strips it from every member who holds it and "
+                "there is no undo, so the answer says how many members hold it and what it granted. "
+                "`role` takes the role NAME or its ID. Refuses with the real reason "
+                "(integration-managed, at/above my own top role, missing Manage Roles)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role to delete: name (case-insensitive, '@' optional) or ID"
+                    },
+                    "role_id": {
+                        "type": "string",
+                        "description": "Deprecated alias for `role` (ID only). Prefer `role`."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Audit-log reason — say who asked and where."
+                    }
+                },
+                "required": []
             }
         ),
         Tool(
             name="list_roles",
             description=(
-                "List the server's roles, highest first. Each line says whether I can actually "
-                "assign it (hierarchy / integration-managed) and which staff permissions it grants, "
-                "so you can see what add_role will accept before calling it. To see WHO holds a "
+                "List the server's roles, highest first — name, ID, position, colour, icon, hoist/"
+                "mentionable flags. Each line says whether I can actually assign it (hierarchy / "
+                "integration-managed) and which staff permissions it grants, so you can see what "
+                "add_role and edit_role will accept before calling them. Pass `role` to get ONE "
+                "role in full, with every permission it grants spelled out. To see WHO holds a "
                 "role, use list_members with its `role` filter."
             ),
             inputSchema={
@@ -1239,6 +1591,10 @@ async def list_tools() -> List[Tool]:
                     "server_id": {
                         "type": "string",
                         "description": "Discord server ID. If not provided, the default server ID will be used."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Optional: show just this role (name or ID) in full detail — every permission it grants, its colour and icon."
                     }
                 },
                 "required": []
@@ -2569,94 +2925,11 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         )]
         
     # Role Management Tools
-    elif name == "create_role":
-        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
-        if not server_id:
-            return [TextContent(
-                type="text",
-                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
-            )]
-            
-        guild = await discord_client.fetch_guild(int(server_id))
-        
-        try:
-            # Set up role creation parameters
-            params = {
-                "name": arguments["name"],
-                "reason": "Role created via MCP"
-            }
-            
-            # Handle optional parameters
-            if "color" in arguments:
-                color_str = arguments["color"].lstrip('#')
-                color_int = int(color_str, 16)
-                params["colour"] = discord.Colour(color_int)
-                
-            if "hoist" in arguments:
-                params["hoist"] = arguments["hoist"]
-                
-            if "mentionable" in arguments:
-                params["mentionable"] = arguments["mentionable"]
-                
-            if "permissions" in arguments:
-                permissions_int = int(arguments["permissions"])
-                params["permissions"] = discord.Permissions(permissions=permissions_int)
-            
-            # Create the role
-            role = await guild.create_role(**params)
-            
-            return [TextContent(
-                type="text",
-                text=f"Created role {role.name} (ID: {role.id})"
-            )]
-        except Exception as e:
-            return [TextContent(
-                type="text",
-                text=f"Error creating role: {str(e)}"
-            )]
-    
-    elif name == "delete_role":
-        server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
-        if not server_id:
-            return [TextContent(
-                type="text",
-                text="Error: No server ID provided and no default server ID set. Set DEFAULT_SERVER_ID environment variable or provide server_id in the request."
-            )]
-            
-        guild = await discord_client.fetch_guild(int(server_id))
-        role_id = int(arguments["role_id"])
-        
-        try:
-            # Find the role
-            role = guild.get_role(role_id)
-            if not role:
-                roles = await guild.fetch_roles()
-                for r in roles:
-                    if r.id == role_id:
-                        role = r
-                        break
-            
-            if not role:
-                return [TextContent(
-                    type="text",
-                    text=f"Error: Role with ID {role_id} not found in the server."
-                )]
-            
-            # Delete the role
-            role_name = role.name
-            await role.delete(reason=arguments.get("reason", "Role deleted via MCP"))
-            
-            return [TextContent(
-                type="text",
-                text=f"Deleted role {role_name} (ID: {role_id})"
-            )]
-        except Exception as e:
-            return [TextContent(
-                type="text",
-                text=f"Error deleting role: {str(e)}"
-            )]
-    
-    elif name == "list_roles":
+    # create_role / edit_role / delete_role / list_roles share their entire preamble — the guild, my
+    # own member object (every hierarchy and escalation check needs it) and, for the three that name
+    # one, the role itself. One branch keeps that in a single place, the same way add_role and
+    # remove_role are one handler above.
+    elif name in ("create_role", "edit_role", "delete_role", "list_roles"):
         server_id = arguments.get("server_id", DEFAULT_SERVER_ID)
         if not server_id:
             return [TextContent(
@@ -2665,48 +2938,272 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             )]
 
         guild = await discord_client.fetch_guild(int(server_id))
-
         try:
-            roles = sorted(await guild.fetch_roles(), key=lambda r: r.position, reverse=True)
             me = await guild.fetch_member(discord_client.user.id)
+        except discord.HTTPException as e:
+            return [TextContent(type="text", text=f"Could not read my own membership in {guild.name}: {e}")]
 
+        # ---- list_roles: the whole ladder, or one role in full -------------------------------
+        if name == "list_roles":
+            try:
+                roles = sorted(await guild.fetch_roles(), key=lambda r: r.position, reverse=True)
+            except discord.HTTPException as e:
+                return [TextContent(type="text", text=f"Error listing roles: {e}")]
+
+            wanted = str(arguments.get("role") or "").strip()
+            if wanted:
+                role = _resolve_role(guild, wanted)
+                if role is None:
+                    return [TextContent(
+                        type="text",
+                        text=f"No role matching '{wanted}' in this server. Call list_roles without `role` for the full list."
+                    )]
+                grants = [n for n, on in role.permissions if on]
+                lines = [
+                    _role_line(role, me),
+                    f"  Assignable: {_unassignable_reason(role, me) or 'yes'}",
+                    f"  Editable:   {_uneditable_reason(role, me) or 'yes'}",
+                    f"  Grants ({len(grants)}): " + (", ".join(sorted(grants)) or "— nothing (cosmetic)"),
+                ]
+                return [TextContent(type="text", text="\n".join(lines))]
+
+            icons = ("role icons: available" if _role_icons_available(guild)
+                     else "role icons: NOT available on this server (needs boost level 2)")
             lines = [
                 f"Roles in {guild.name} ({len(roles)}), highest first. "
-                f"My own top role: '{me.top_role.name}' (position {me.top_role.position}).",
+                f"My own top role: '{me.top_role.name}' (position {me.top_role.position}); {icons}.",
                 "  ✅ I can add/remove it   ✋ I cannot (reason in brackets)   ⚠ grants staff powers",
             ]
-            for role in roles:
-                blocked = _unassignable_reason(role, me)
-                mark = "✋" if blocked else "✅"
-                bits = [f"ID: {role.id}", f"position {role.position}"]
-                if role.managed:
-                    bits.append("integration-managed")
-                if role.hoist:
-                    bits.append("shown separately")
-                if role.mentionable:
-                    bits.append("mentionable")
-                line = f"{mark} {role.name} ({', '.join(bits)})"
-                if blocked:
-                    # The full sentence lives in the error path; here just the short cause.
-                    if role.is_default():
-                        line += " [everyone has it]"
-                    elif role.managed:
-                        line += " [managed — never assignable]"
-                    elif role >= me.top_role:
-                        line += " [at/above my top role]"
-                    else:
-                        line += " [I lack Manage Roles]"
-                perms = _privileged_perms(role)
-                if perms:
-                    line += f"  ⚠ grants: {', '.join(perms)}"
-                lines.append(line)
-
+            lines += [_role_line(r, me) for r in roles]
             return [TextContent(type="text", text="\n".join(lines))]
-        except Exception as e:
+
+        # ---- create_role --------------------------------------------------------------------
+        if name == "create_role":
+            if not (me.guild_permissions.manage_roles or me.guild_permissions.administrator):
+                return [TextContent(
+                    type="text",
+                    text="Cannot create a role: I don't have the 'Manage Roles' permission in this server."
+                )]
+
+            params = {"name": arguments["name"], "reason": arguments.get("reason", "Role created via MCP")}
+            said = []
+            try:
+                if arguments.get("color") is not None:
+                    colour = _parse_colour(arguments["color"])
+                    params["colour"] = colour
+                    said.append("no colour" if colour.value == 0 else f"colour {colour}")
+                if arguments.get("hoist") is not None:
+                    params["hoist"] = bool(arguments["hoist"])
+                if arguments.get("mentionable") is not None:
+                    params["mentionable"] = bool(arguments["mentionable"])
+                if arguments.get("permissions") is not None:
+                    perms = _permissions_from(arguments["permissions"])
+                    blocked = _escalation_reason(perms, me)
+                    if blocked:
+                        return [TextContent(type="text", text=f"Cannot create '{arguments['name']}': {blocked}")]
+                    params["permissions"] = perms
+                if arguments.get("icon_emoji") or arguments.get("icon_file_path") or arguments.get("icon_url"):
+                    if not _role_icons_available(guild):
+                        return [TextContent(
+                            type="text",
+                            text=f"Cannot give '{arguments['name']}' an icon: {guild.name} doesn't have role icons "
+                                 "(Discord unlocks them at server boost level 2). Everything else about the role still works."
+                        )]
+                    params["display_icon"], icon_said = await _role_icon_from(
+                        guild, arguments.get("icon_emoji"), arguments.get("icon_file_path"), arguments.get("icon_url"))
+                    said.append(f"icon {icon_said}")
+            except (ValueError, RuntimeError) as e:
+                return [TextContent(type="text", text=f"Error creating role: {e}")]
+
+            try:
+                role = await guild.create_role(**params)
+            except discord.Forbidden as e:
+                return [TextContent(type="text", text=f"Discord refused to create '{arguments['name']}': {e}")]
+            except discord.HTTPException as e:
+                return [TextContent(type="text", text=f"Discord error while creating '{arguments['name']}': {e}")]
+
+            if arguments.get("position") is not None:
+                pos = int(arguments["position"])
+                if 1 <= pos < me.top_role.position:
+                    try:
+                        await _move_role(guild, role, pos, params["reason"])
+                        landed = await _refetch_role(guild, role.id)
+                        said.append(f"position {landed.position if landed else pos}")
+                    except discord.HTTPException as e:
+                        said.append(f"position NOT changed ({e})")
+                else:
+                    said.append(f"position {pos} refused (must be ≥ 1 and below my top role at {me.top_role.position})")
+
+            perms = _privileged_perms(role)
+            note = f"\n⚠ This role grants: {', '.join(perms)}." if perms else ""
+            detail = (" — " + ", ".join(said)) if said else ""
             return [TextContent(
                 type="text",
-                text=f"Error listing roles: {str(e)}"
+                text=f"Created role '{role.name}' (ID: {role.id}){detail}. Nobody holds it yet — hand it out with add_role.{note}"
             )]
+
+        # ---- edit_role / delete_role: both name an existing role -----------------------------
+        role_arg = str(arguments.get("role") or arguments.get("role_id") or "").strip()
+        if not role_arg:
+            return [TextContent(type="text", text="Error: which role? Pass `role` (name or ID).")]
+        role = _resolve_role(guild, role_arg)
+        if role is None:
+            return [TextContent(
+                type="text",
+                text=f"Error: no role matching '{role_arg}' in this server. Call list_roles for the exact names and IDs."
+            )]
+
+        verb = "edit" if name == "edit_role" else "delete"
+        blocked = _uneditable_reason(role, me)
+        if blocked:
+            return [TextContent(type="text", text=f"Cannot {verb} '{role.name}': {blocked}")]
+
+        if name == "delete_role":
+            holders, capped = await _role_holder_count(guild, role)
+            perms = _privileged_perms(role)
+            role_name, role_id = role.name, role.id
+            try:
+                await role.delete(reason=arguments.get("reason", "Role deleted via MCP"))
+            except discord.Forbidden as e:
+                return [TextContent(type="text", text=f"Discord refused to delete '{role_name}': {e}")]
+            except discord.HTTPException as e:
+                return [TextContent(type="text", text=f"Discord error while deleting '{role_name}': {e}")]
+
+            if holders is None:
+                lost = "I couldn't count how many members held it."
+            else:
+                lost = f"{holders}{'+' if capped else ''} member(s) lost it."
+            note = f" It granted: {', '.join(perms)}." if perms else ""
+            return [TextContent(
+                type="text",
+                text=f"Deleted role '{role_name}' (ID: {role_id}). {lost}{note} This cannot be undone."
+            )]
+
+        # ---- edit_role ----------------------------------------------------------------------
+        edits, said = {}, []
+        try:
+            if arguments.get("name"):
+                edits["name"] = arguments["name"]
+                said.append(f"renamed to '{arguments['name']}'")
+            if arguments.get("color") is not None:
+                colour = _parse_colour(arguments["color"])
+                edits["colour"] = colour
+                said.append("colour cleared" if colour.value == 0 else f"colour {colour}")
+            if arguments.get("hoist") is not None:
+                edits["hoist"] = bool(arguments["hoist"])
+                said.append("shown separately" if edits["hoist"] else "no longer shown separately")
+            if arguments.get("mentionable") is not None:
+                edits["mentionable"] = bool(arguments["mentionable"])
+                said.append("mentionable" if edits["mentionable"] else "not mentionable")
+
+            # Permissions: `permissions` replaces the whole set, grant/revoke nudge it. Both forms
+            # end in one Permissions object, so the escalation check below sees the real diff.
+            perms = None
+            if arguments.get("permissions") is not None:
+                perms = _permissions_from(arguments["permissions"])
+            if arguments.get("grant_permissions") or arguments.get("revoke_permissions"):
+                base = perms if perms is not None else discord.Permissions(role.permissions.value)
+                for n in _parse_perm_names(arguments.get("grant_permissions") or [], "grant_permissions"):
+                    setattr(base, n, True)
+                for n in _parse_perm_names(arguments.get("revoke_permissions") or [], "revoke_permissions"):
+                    setattr(base, n, False)
+                perms = base
+            if perms is not None:
+                # Discord requires every permission you CHANGE (either way) to be one you hold
+                # yourself, so the check is on the diff — not on the role's whole set, which may
+                # legitimately contain powers I lack and am not touching.
+                added = [n for n, on in perms if on and not getattr(role.permissions, n, False)]
+                removed = [n for n, on in perms if not on and getattr(role.permissions, n, False)]
+                if added or removed:
+                    esc = _escalation_reason(discord.Permissions(**{n: True for n in added + removed}), me)
+                    if esc:
+                        return [TextContent(type="text", text=f"Cannot edit '{role.name}': {esc}")]
+                    edits["permissions"] = perms
+                    if added:
+                        said.append("grants " + ", ".join(sorted(added)))
+                    if removed:
+                        said.append("no longer grants " + ", ".join(sorted(removed)))
+
+            if arguments.get("clear_icon"):
+                edits["display_icon"] = None
+                said.append("icon removed")
+            elif arguments.get("icon_emoji") or arguments.get("icon_file_path") or arguments.get("icon_url"):
+                if not _role_icons_available(guild):
+                    return [TextContent(
+                        type="text",
+                        text=f"Cannot set an icon on '{role.name}': {guild.name} doesn't have role icons "
+                             "(Discord unlocks them at server boost level 2)."
+                    )]
+                edits["display_icon"], icon_said = await _role_icon_from(
+                    guild, arguments.get("icon_emoji"), arguments.get("icon_file_path"), arguments.get("icon_url"))
+                said.append(f"icon {icon_said}")
+
+            # Position: absolute, or relative to another role. `above`/`below` are what a request
+            # actually means ("выше Соседей") — an absolute number alone is easy to get backwards,
+            # since Discord counts UP from @everyone at 0. The move goes through the bulk endpoint
+            # (see _move_role) and is reported from a re-read, not from what we asked for.
+            move_to, move_said = arguments.get("position"), None
+            for key, delta in (("above", +1), ("below", -1)):
+                if arguments.get(key):
+                    target = _resolve_role(guild, arguments[key])
+                    if target is None:
+                        return [TextContent(
+                            type="text",
+                            text=f"Error: no role matching '{arguments[key]}' to place '{role.name}' {key}."
+                        )]
+                    move_to, move_said = target.position + delta, f"{key} '{target.name}'"
+                    break
+            if move_to is not None:
+                move_to = int(move_to)
+                if move_to < 1:
+                    return [TextContent(
+                        type="text",
+                        text="Error: position 0 is @everyone — nothing can sit at or below it. Use 1 for the lowest real role."
+                    )]
+                if move_to >= me.top_role.position:
+                    return [TextContent(
+                        type="text",
+                        text=f"Cannot move '{role.name}' to position {move_to}: my own top role "
+                             f"'{me.top_role.name}' sits at {me.top_role.position}, and Discord only lets me "
+                             "arrange roles strictly beneath it."
+                    )]
+        except (ValueError, RuntimeError) as e:
+            return [TextContent(type="text", text=f"Error editing '{role.name}': {e}")]
+
+        if not edits and move_to is None:
+            return [TextContent(
+                type="text",
+                text="Error: nothing to change — pass name, color, hoist, mentionable, permissions/"
+                     "grant_permissions/revoke_permissions, an icon (icon_emoji/icon_file_path/icon_url/"
+                     "clear_icon) or a position (position/above/below)."
+            )]
+
+        reason = arguments.get("reason", "Role edited via MCP")
+        try:
+            if edits:
+                await role.edit(reason=reason, **edits)
+            if move_to is not None:
+                await _move_role(guild, role, move_to, reason)
+        except discord.Forbidden as e:
+            return [TextContent(type="text", text=f"Discord refused to edit '{role.name}': {e}")]
+        except discord.HTTPException as e:
+            return [TextContent(type="text", text=f"Discord error while editing '{role.name}': {e}")]
+
+        # Report from a re-read, never from the request: a move can land somewhere other than the
+        # number asked for (Discord renumbers neighbours), and saying "moved above X" when it didn't
+        # is worse than saying nothing.
+        fresh = await _refetch_role(guild, role.id) or role
+        if move_to is not None:
+            said.append(f"{move_said} (now position {fresh.position})" if move_said
+                        else f"position {fresh.position}")
+        note = ""
+        if "permissions" in edits and _privileged_perms(fresh):
+            note = f"\n⚠ This role now grants: {', '.join(_privileged_perms(fresh))}."
+        return [TextContent(
+            type="text",
+            text=f"Role '{role.name}' (ID: {role.id}): " + ", ".join(said) + ".\n"
+                 f"Now: {_role_line(fresh, me)}{note}"
+        )]
 
     # Custom Emoji Tools
     elif name == "list_emojis":
