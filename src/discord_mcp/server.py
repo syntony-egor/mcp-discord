@@ -695,6 +695,25 @@ def _stop_typing(channel_id: int):
         t.cancel()
 
 
+# Last message id this bot sent per channel (the thread's parent too). A late start_typing —
+# issued after the reply already went out — must not light the indicator back up: that is how
+# "typing…" used to hang for 10-20 s under a finished answer.
+_last_sent = {}             # channel_id -> message snowflake
+
+
+def _note_sent(channel, message_id: int | None = None):
+    """A reply (message/file/voice/sticker/reaction) went out: stop typing here AND in the parent
+    channel when this is a thread — answers often land in a thread opened on the pinged message."""
+    ids = [channel.id]
+    parent = getattr(channel, "parent_id", None)
+    if parent:
+        ids.append(parent)
+    for cid in ids:
+        _stop_typing(cid)
+        if message_id:
+            _last_sent[cid] = max(_last_sent.get(cid, 0), int(message_id))
+
+
 async def _reassert_presence(reason: str):
     try:
         await bot.change_presence(**_desired_presence)
@@ -1126,13 +1145,17 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="start_typing",
-            description="Start a CONTINUOUS 'Bot is typing…' indicator in a channel — re-triggered every ~8s so it stays visible the whole time you think. Auto-stops when you send a message there (or call stop_typing). Call right when you begin composing a reply.",
+            description="Start a CONTINUOUS 'Bot is typing…' indicator in a channel — re-triggered every ~8s so it stays visible the whole time you think. Auto-stops when you send a message/file/voice/sticker/reaction there or into a thread of that channel (or call stop_typing). Call right when you begin composing a reply.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel_id": {
                         "type": "string",
                         "description": "Channel to show the typing indicator in"
+                    },
+                    "after_message_id": {
+                        "type": "string",
+                        "description": "Optional: the message you are answering. If this bot already replied after it (in this channel or in a thread opened on it), typing is NOT started — avoids a stale indicator under a finished reply."
                     }
                 },
                 "required": ["channel_id"]
@@ -1899,7 +1922,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     if name == "send_message":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         message = await channel.send(arguments["content"])
-        _stop_typing(int(arguments["channel_id"]))   # reply sent → stop the typing loop
+        _note_sent(channel, message.id)              # reply sent → stop the typing loop (+ thread parent)
         return [TextContent(
             type="text",
             text=f"Message sent successfully. Message ID: {message.id}"
@@ -1931,6 +1954,14 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "start_typing":
         cid = int(arguments["channel_id"])
+        after = int(arguments.get("after_message_id") or 0)
+        # the reply to that message already went out (here, or into a thread opened on it — its
+        # id equals the message id) → a late start would hang "typing…" under a finished answer
+        if after and (_last_sent.get(cid, 0) > after or after in _last_sent):
+            return [TextContent(
+                type="text",
+                text=f"Typing skipped in channel {cid}: a reply after message {after} was already sent"
+            )]
         _stop_typing(cid)                            # restart cleanly if one is already running
         _typing_tasks[cid] = asyncio.create_task(_typing_loop(cid))
         return [TextContent(
@@ -1977,6 +2008,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
         file = discord.File(file_path)
         message = await channel.send(content=content if content else None, file=file)
+        _note_sent(channel, message.id)
         return [TextContent(
             type="text",
             text=f"File sent successfully. Message ID: {message.id}"
@@ -1984,6 +2016,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "send_voice_message":
         message_id = await _send_voice_message(int(arguments["channel_id"]), arguments["file_path"])
+        _note_sent(await discord_client.fetch_channel(int(arguments["channel_id"])), message_id)
         return [TextContent(
             type="text",
             text=f"Voice message sent successfully. Message ID: {message_id}"
